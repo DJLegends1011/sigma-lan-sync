@@ -75,6 +75,61 @@ async function makeDetector(video) {
 }
 
 /**
+ * Decode a QR code from an image File/Blob (a camera snapshot or screenshot) without getUserMedia.
+ * @param {Blob} file
+ * @returns {Promise<string | null>}
+ */
+export async function decodeQrFromImage(file) {
+    if (!file) return null;
+    let bitmap = null;
+    try {
+        if (typeof createImageBitmap === 'function') {
+            bitmap = await createImageBitmap(file);
+        } else {
+            const url = URL.createObjectURL(file);
+            try {
+                bitmap = await new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => resolve(img);
+                    img.onerror = reject;
+                    img.src = url;
+                });
+            } finally {
+                URL.revokeObjectURL(url);
+            }
+        }
+        if ('BarcodeDetector' in window) {
+            try {
+                const formats = await window.BarcodeDetector.getSupportedFormats();
+                if (formats.includes('qr_code')) {
+                    const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+                    const hit = (await detector.detect(bitmap))[0]?.rawValue;
+                    if (hit) return hit;
+                }
+            } catch { /* fall back to jsQR */ }
+        }
+        const jsQR = await loadJsQR();
+        const w = bitmap.width || bitmap.naturalWidth || 0;
+        const h = bitmap.height || bitmap.naturalHeight || 0;
+        if (!w || !h) return null;
+        const canvas = document.createElement('canvas');
+        const g = canvas.getContext('2d', { willReadFrequently: true });
+        for (const maxEdge of [1200, 720, 1800]) {
+            const scale = Math.min(1, maxEdge / Math.max(w, h));
+            canvas.width = Math.round(w * scale);
+            canvas.height = Math.round(h * scale);
+            g.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+            const img = g.getImageData(0, 0, canvas.width, canvas.height);
+            const hit = jsQR(img.data, img.width, img.height, { inversionAttempts: 'attemptBoth' })?.data;
+            if (hit) return hit;
+        }
+        return null;
+    } finally {
+        bitmap?.close?.();
+    }
+}
+
+/**
  * Scan with the camera into a video element until a code reads; answers a stop function.
  * @param {HTMLVideoElement} video
  * @param {(text: string) => void} onCode called once, with the camera already stopped

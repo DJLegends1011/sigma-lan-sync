@@ -1,7 +1,7 @@
 // The Sync panel: this device, pairing (show a code, or scan one), the paired devices and what a sync
 // carries. Its regions paint on their own, so a status refresh never wipes a field being typed in or the
 // camera's picture.
-import { qrSvg, startScanner, cameraBlocker, cameraPermission } from './qr.js';
+import { qrSvg, startScanner, cameraBlocker, cameraPermission, decodeQrFromImage } from './qr.js';
 
 const POLL_MS = 1500;
 
@@ -136,7 +136,13 @@ export function createPanel(ctx) {
             const blocker = cameraBlocker();
             el.innerHTML = `
                 <div class="ls-scan">
-                    <p class="ls-muted">Quickest on a phone: scan the other device's code with your <strong>Camera app</strong> or Google Lens and open the link. It lands here with the pairing filled in.</p>
+                    <p class="ls-muted">Quickest on a phone: tap <strong>Take a Photo of the Code</strong> (uses your phone's camera directly without browser permissions), or scan with your Camera app / Google Lens.</p>
+                    <div class="ls-verbs">
+                        <button type="button" class="cl-btn cl-btn-sm cl-btn-primary" data-ls-act="snap-qr"><i class="fa-solid fa-camera" aria-hidden="true"></i> Take a Photo of the Code</button>
+                        <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-act="pick-qr"><i class="fa-solid fa-image" aria-hidden="true"></i> Choose Screenshot / Image</button>
+                        <input type="file" accept="image/*" capture="environment" data-ls="qr-camera" hidden>
+                        <input type="file" accept="image/*" data-ls="qr-file" hidden>
+                    </div>
                     ${blocker ? `<p class="ls-line is-warning">${esc(blocker)}</p>` : '<video class="ls-video" data-ls="video" aria-label="Camera"></video>'}
                     <div class="settings-row">
                         <label class="ls-muted" for="ls-paste">Or paste the pairing link</label>
@@ -147,6 +153,23 @@ export function createPanel(ctx) {
                     </div>
                     <div class="ls-verbs"><button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-act="stop-scan">Cancel</button></div>
                 </div>`;
+            for (const input of el.querySelectorAll('input[type="file"]')) {
+                input.addEventListener('change', async () => {
+                    const file = input.files?.[0];
+                    input.value = '';
+                    if (!file) return;
+                    try {
+                        const text = await decodeQrFromImage(file);
+                        if (!text) {
+                            CoreAPI.showToast('No QR code found in that picture. Try getting closer or keeping it flat.', 'warning');
+                            return;
+                        }
+                        beginJoin(text);
+                    } catch (e) {
+                        CoreAPI.showToast(`Could not read that picture: ${why(e)}`, 'error');
+                    }
+                });
+            }
             if (!blocker) {
                 const video = el.querySelector('[data-ls="video"]');
                 const instead = (html) => {
@@ -154,7 +177,7 @@ export function createPanel(ctx) {
                     video?.remove();
                 };
                 // a browser that already said no for this site refuses again without asking: say where to undo it
-                const blocked = 'The browser has the camera blocked for this site, so it will not ask. In Chrome, tap the icon left of the address, then <strong>Permissions</strong>, then <strong>Camera</strong>, and allow it (an installed Σ app shares that setting). Or use your Camera app as above, or paste the link below.';
+                const blocked = 'Live camera preview is blocked here (standalone apps often require granting camera permission in a regular Chrome tab first). Tap <strong>Take a Photo of the Code</strong> above to use your camera directly, or paste the link below.';
                 cameraPermission().then((state) => {
                     if (!scanning || !video?.isConnected) return;
                     if (state === 'denied') { instead(blocked); return; }
@@ -162,7 +185,7 @@ export function createPanel(ctx) {
                         .then((stop) => { if (scanning) stopScan = stop; else stop(); })
                         .catch((e) => instead(e?.name === 'NotAllowedError'
                             ? blocked
-                            : `The camera did not start (${esc(why(e))}). Use your Camera app as above, or paste the link below.`));
+                            : `The live camera did not start (${esc(why(e))}). Tap <strong>Take a Photo of the Code</strong> above, or paste the link below.`));
                 });
             }
             return;
@@ -367,6 +390,12 @@ export function createPanel(ctx) {
                     if (offer) { offer = null; call('/pairing/stop', 'POST').catch(() => {}); }
                     scanning = true;
                     paintPair();
+                    break;
+                case 'snap-qr':
+                    region('pair')?.querySelector('[data-ls="qr-camera"]')?.click();
+                    break;
+                case 'pick-qr':
+                    region('pair')?.querySelector('[data-ls="qr-file"]')?.click();
                     break;
                 case 'stop-scan':
                     stopCamera();
