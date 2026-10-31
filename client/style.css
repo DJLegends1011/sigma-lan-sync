@@ -1,0 +1,126 @@
+/* LAN Sync: the Sync panel. Extension sheets load in the module layer, below the reader's custom CSS. */
+
+.ls-dialog { width: min(720px, 100%); }
+
+.ls-panel {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+}
+
+.ls-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    padding: var(--space-md);
+    border-radius: var(--radius-lg);
+    background: var(--cl-ghost-soft);
+    border: 1px solid var(--glass-border);
+    min-width: 0;
+}
+
+.ls-heading {
+    margin: 0;
+    font-weight: 600;
+    font-size: var(--font-4xs);
+    letter-spacing: var(--tracking-ui);
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+.ls-line { margin: 0; color: var(--text-secondary); overflow-wrap: anywhere; }
+.ls-muted { margin: 0; font-size: var(--font-xs); color: var(--text-muted); overflow-wrap: anywhere; }
+.ls-line.is-error { color: var(--cl-error); }
+.ls-line.is-warning { color: var(--cl-warning, var(--text-secondary)); }
+.ls-line.is-success { color: var(--cl-success, var(--accent)); }
+
+.ls-verbs { display: flex; flex-wrap: wrap; gap: var(--space-sm); }
+
+.ls-chips { display: flex; flex-wrap: wrap; gap: var(--space-xs); }
+.ls-chip {
+    font-family: var(--font-stack-mono);
+    font-size: var(--font-xs);
+    padding: var(--space-2xs) var(--space-sm);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--glass-border);
+    color: var(--text-secondary);
+}
+.ls-chip em { font-style: normal; color: var(--text-muted); }
+
+.ls-code {
+    font-family: var(--font-stack-mono);
+    font-size: var(--font-md-lg);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    color: var(--text-primary);
+}
+
+.ls-offer {
+    display: grid;
+    grid-template-columns: minmax(0, 240px) minmax(0, 1fr);
+    gap: var(--space-md);
+    align-items: start;
+}
+.ls-qr { background: #fff; border-radius: var(--radius-md); padding: var(--space-xs); line-height: 0; }
+.ls-qr svg { width: 100%; height: auto; }
+.ls-offer-side, .ls-join, .ls-scan, .ls-requests { display: flex; flex-direction: column; gap: var(--space-sm); min-width: 0; }
+
+.ls-request {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    padding: var(--space-sm);
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(var(--accent-rgb), 0.5);
+}
+
+.ls-video {
+    width: 100%;
+    max-height: 50vh;
+    border-radius: var(--radius-md);
+    background: #000;
+    object-fit: cover;
+}
+
+.ls-linkbox summary { cursor: pointer; }
+.ls-linktext {
+    display: block;
+    margin-top: var(--space-xs);
+    font-family: var(--font-stack-mono);
+    font-size: var(--font-3xs);
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+    user-select: all;
+}
+
+.ls-paste-row { display: flex; gap: var(--space-sm); }
+.ls-paste-row input { flex: 1; min-width: 0; }
+
+.ls-checks { display: flex; flex-direction: column; gap: var(--space-xs); }
+
+.ls-peers { display: flex; flex-direction: column; gap: var(--space-sm); }
+.ls-peer {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    padding: var(--space-sm-md);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--glass-border);
+}
+.ls-peer-head { display: flex; align-items: center; gap: var(--space-sm); color: var(--text-primary); }
+.ls-peer-name { display: flex; flex-direction: column; min-width: 0; }
+.ls-link {
+    all: unset;
+    cursor: pointer;
+    font-family: var(--font-stack-mono);
+    font-size: var(--font-xs);
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+.ls-link:hover, .ls-link:focus-visible { color: var(--accent); text-decoration: underline; }
+.cl-btn.ls-danger:hover { color: var(--cl-error); }
+
+@media (max-width: 600px) {
+    .ls-offer { grid-template-columns: minmax(0, 1fr); }
+    .ls-qr { max-width: 280px; justify-self: center; width: 100%; }
+}
