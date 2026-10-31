@@ -268,6 +268,8 @@ export function createPanel(ctx) {
                 </select>
                 <span class="settings-hint">Prefer newer compares each device's own clock.</span>
             </div>`;
+        // the app draws its own dropdowns over native selects; it does so for its own markup, so ours ask
+        el.querySelectorAll('select').forEach(s => CoreAPI.initCustomSelect(s));
     }
 
     // ── refresh and the clicks ──────────────────────────────
@@ -278,7 +280,11 @@ export function createPanel(ctx) {
             status = await call('/status');
         } catch (e) {
             const el = region('peers');
-            if (el) el.innerHTML = `<p class="ls-line is-error">${esc(why(e))}</p>`;
+            // a server half loads at boot, so a fresh install answers nothing until the server restarts
+            const message = e?.status === 404
+                ? 'LAN Sync is installed, but its server part starts only when Σ does. Restart Σ, then open this again.'
+                : why(e);
+            if (el) el.innerHTML = `<p class="ls-line ${e?.status === 404 ? 'is-warning' : 'is-error'}">${esc(message)}</p>`;
             return;
         }
         paintDevice();
