@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { makePlan, planCounts, alignSource } from '../server/plan.js';
 import { buildPairLink, parsePairLink } from '../client/pair-link.js';
 
-const all = ['characters', 'chats', 'lorebooks'];
+const all = ['characters', 'chats', 'lorebooks', 'personas', 'presets', 'playlists'];
 const char = (id, o = {}) => ({ id, card: `c-${id}`, meta: `m-${id}`, mediaCount: 0, updatedAt: 1, ...o });
 const chat = (id, charId, name, o = {}) => ({ id, charId, name, digest: `d-${id}`, updatedAt: 1, ...o });
 
@@ -91,4 +91,33 @@ test('a pairing link round-trips, and junk is refused', () => {
     assert.deepEqual(parsePairLink(`scanned: ${link}`), offer);
     assert.equal(parsePairLink('https://example.com'), null);
     assert.equal(parsePairLink(''), null);
+});
+
+test('personas, presets and playlists match by id or name, translate member aliases, and respect prefer-newer and mirror', () => {
+    const source = {
+        characters: [char('s-char', { card: 'same' })],
+        chats: [],
+        worlds: [],
+        personas: [{ id: 'p-src', name: 'Capt', digest: 'p2', updatedAt: 10 }],
+        presets: [{ id: 'pr-src', name: 'Story', digest: 'pr2', updatedAt: 2 }],
+        playlists: [{ id: 'pl-src', name: 'Sci-Fi', digest: 'pl2', updatedAt: 10, members: ['s-char'] }],
+    };
+    const target = {
+        characters: [char('t-char', { card: 'same' })],
+        chats: [],
+        worlds: [],
+        personas: [{ id: 'p-tgt', name: 'capt', digest: 'p1', updatedAt: 5 }, { id: 'p-old', name: 'OldPersona', digest: 'po', updatedAt: 1 }],
+        presets: [{ id: 'pr-tgt', name: 'Story', digest: 'pr1', updatedAt: 9 }],
+        playlists: [],
+    };
+    const { source: aligned } = alignSource(source, target, {});
+    assert.deepEqual(aligned.playlists[0].members, ['t-char']);
+
+    const plan = makePlan(aligned, target, { datasets: all, mode: 'mirror', overwrite: 'prefer-newer' });
+    assert.deepEqual(plan.personas.update, [{ id: 'p-src', targetId: 'p-tgt', name: 'Capt' }]);
+    assert.deepEqual(plan.personas.delete, ['p-old']);
+    // preset on target is newer (9 > 2) -> kept
+    assert.equal(plan.presets.update.length, 0);
+    assert.equal(plan.kept, 1);
+    assert.deepEqual(plan.playlists.create, [{ id: 'pl-src', name: 'Sci-Fi', members: ['t-char'] }]);
 });

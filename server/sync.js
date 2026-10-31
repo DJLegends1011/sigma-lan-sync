@@ -1,13 +1,13 @@
 // A pull: scan both libraries, plan, then apply the plan through this server's own API. The order is
 // TauriTavern's: transfers first, deletions last, so a sync stopped part way never leaves a library with
 // less than it started with. Lorebooks go before characters, whose links name them.
-import { buildManifest, walk, chatRows, eachLimited } from './manifest.js';
+import { buildManifest, walk, chatRows, eachLimited, presetBlocksContent } from './manifest.js';
 import { makePlan, planCounts, planSize, alignSource } from './plan.js';
 
 const enc = encodeURIComponent;
 const BUNDLE_BATCH = 10;
 
-const datasetsOf = (o) => ['characters', 'chats', 'lorebooks'].filter(d => o[d] !== false);
+const datasetsOf = (o) => ['characters', 'chats', 'lorebooks', 'personas', 'presets', 'playlists'].filter(d => o[d] !== false);
 
 const addCounts = (a, b) => Object.fromEntries(Object.keys(b).map(k => [k, (a?.[k] || 0) + b[k]]));
 
@@ -147,7 +147,99 @@ async function pullPass({ local, peer, store, options, aliases, signal, progress
         step(`Chat ${c.name}`);
     }
 
+    // ── personas ──
+    for (const p of plan.personas.create) {
+        await attempt(`persona "${p.name}"`, async () => {
+            const detail = await peer.json(`/peer/persona/${enc(p.id)}`, { signal });
+            const made = await local.json('/api/personas', {
+                method: 'POST',
+                json: { name: detail.name, description: detail.description || '', pronouns: detail.pronouns || {} },
+                signal,
+            });
+            await syncPersonaExtras({ local, peer, sourceId: p.id, targetId: made.id, worlds: detail.worlds, signal });
+        });
+        step(`Persona ${p.name}`);
+    }
+    for (const p of plan.personas.update) {
+        await attempt(`persona "${p.name}"`, async () => {
+            const detail = await peer.json(`/peer/persona/${enc(p.id)}`, { signal });
+            await local.request(`/api/personas/${enc(p.targetId)}`, {
+                method: 'PATCH',
+                json: { name: detail.name, description: detail.description || '', pronouns: detail.pronouns || {} },
+                signal,
+            });
+            await syncPersonaExtras({ local, peer, sourceId: p.id, targetId: p.targetId, worlds: detail.worlds, signal });
+        });
+        step(`Persona ${p.name}`);
+    }
+
+    // ── presets ──
+    for (const p of plan.presets.create) {
+        await attempt(`preset "${p.name}"`, async () => {
+            const detail = await peer.json(`/peer/preset/${enc(p.id)}`, { signal });
+            await local.request('/api/presets', {
+                method: 'POST',
+                json: { name: detail.name, blocks: presetBlocksContent(detail.blocks) },
+                signal,
+            });
+        });
+        step(`Preset ${p.name}`);
+    }
+    for (const p of plan.presets.update) {
+        await attempt(`preset "${p.name}"`, async () => {
+            const detail = await peer.json(`/peer/preset/${enc(p.id)}`, { signal });
+            await local.request(`/api/presets/${enc(p.targetId)}`, {
+                method: 'PATCH',
+                json: { name: detail.name, blocks: presetBlocksContent(detail.blocks) },
+                signal,
+            });
+        });
+        step(`Preset ${p.name}`);
+    }
+
+    // ── playlists ──
+    for (const p of plan.playlists.create) {
+        await attempt(`playlist "${p.name}"`, async () => {
+            const detail = await peer.json(`/peer/playlist/${enc(p.id)}`, { signal });
+            const made = await local.json('/api/playlists', {
+                method: 'POST',
+                json: { name: detail.name, description: detail.description || '', icon: detail.icon || '', color: detail.color || '' },
+                signal,
+            });
+            await applyPlaylistMemberships(local, made.id, { add: p.members || [], remove: [] }, signal);
+        });
+        step(`Playlist ${p.name}`);
+    }
+    for (const p of plan.playlists.update) {
+        await attempt(`playlist "${p.name}"`, async () => {
+            const detail = await peer.json(`/peer/playlist/${enc(p.id)}`, { signal });
+            await local.request(`/api/playlists/${enc(p.targetId)}`, {
+                method: 'PATCH',
+                json: { name: detail.name, description: detail.description || '', icon: detail.icon || '', color: detail.color || '' },
+                signal,
+            });
+            const wantSet = new Set(p.members || []);
+            const haveSet = new Set(p.targetMembers || []);
+            const add = (p.members || []).filter(id => !haveSet.has(id));
+            const remove = options.mode === 'mirror' ? (p.targetMembers || []).filter(id => !wantSet.has(id)) : [];
+            await applyPlaylistMemberships(local, p.targetId, { add, remove }, signal);
+        });
+        step(`Playlist ${p.name}`);
+    }
+
     // ── Mirror: what the source does not hold, last ──
+    for (const id of plan.playlists.delete) {
+        await attempt(`removing playlist ${id}`, () => local.request(`/api/playlists/${enc(id)}`, { method: 'DELETE', signal }));
+        step('Removing a playlist');
+    }
+    for (const id of plan.presets.delete) {
+        await attempt(`removing preset ${id}`, () => local.request(`/api/presets/${enc(id)}`, { method: 'DELETE', signal }));
+        step('Removing a preset');
+    }
+    for (const id of plan.personas.delete) {
+        await attempt(`removing persona ${id}`, () => local.request(`/api/personas/${enc(id)}`, { method: 'DELETE', signal }));
+        step('Removing a persona');
+    }
     for (const id of plan.chats.delete) {
         await attempt(`removing chat ${id}`, () => local.request(`/api/chats/${enc(id)}`, { method: 'DELETE', signal }));
         step('Removing a chat');
@@ -179,4 +271,37 @@ async function pullGallery({ local, peer, id, sourceId, signal }) {
             method: 'POST', body: bytes, headers: { 'Content-Type': 'application/octet-stream' }, signal,
         });
     }, signal);
+}
+
+async function syncPersonaExtras({ local, peer, sourceId, targetId, worlds, signal }) {
+    if (Array.isArray(worlds)) {
+        await local.request(`/api/personas/${enc(targetId)}/worlds`, {
+            method: 'PUT', json: { worlds }, signal, ok: false,
+        });
+    }
+    const av = await peer.request(`/peer/persona/${enc(sourceId)}/avatar`, { signal, ok: false });
+    if (av.ok) {
+        const bytes = Buffer.from(await av.arrayBuffer());
+        if (bytes.length) {
+            await local.request(`/api/personas/${enc(targetId)}/avatar`, {
+                method: 'PUT', body: bytes, headers: { 'Content-Type': 'image/png' }, signal,
+            });
+        }
+    } else if (av.status === 404) {
+        await local.request(`/api/personas/${enc(targetId)}/avatar`, { method: 'DELETE', signal, ok: false });
+    }
+}
+
+async function applyPlaylistMemberships(local, playlistId, { add = [], remove = [] }, signal) {
+    const CHUNK = 500;
+    for (let i = 0; i < add.length; i += CHUNK) {
+        await local.request(`/api/playlists/${enc(playlistId)}/members/apply`, {
+            method: 'POST', json: { add: add.slice(i, i + CHUNK) }, signal,
+        });
+    }
+    for (let i = 0; i < remove.length; i += CHUNK) {
+        await local.request(`/api/playlists/${enc(playlistId)}/members/apply`, {
+            method: 'POST', json: { remove: remove.slice(i, i + CHUNK) }, signal,
+        });
+    }
 }

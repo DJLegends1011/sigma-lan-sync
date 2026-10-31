@@ -88,7 +88,7 @@ export function localClient(base) {
 /** A client for a paired device's server half: every request signed with the pair's secret. */
 export function peerClient({ address, deviceId, secret }) {
     const base = `http://${address}`;
-    const request = async (path, { method = 'GET', json, signal, timeout = 30_000 } = {}) => {
+    const request = async (path, { method = 'GET', json, signal, timeout = 30_000, ok = true } = {}) => {
         const full = `${EXT_ROOT}${path}`;
         const bodyText = method === 'GET' ? '' : JSON.stringify(json ?? {});
         const headers = signHeaders({ deviceId, secret }, method, full, bodyText);
@@ -100,7 +100,7 @@ export function peerClient({ address, deviceId, secret }) {
             if (signal?.aborted) throw e;
             throw new Error(`could not reach ${address}: ${e.cause?.code || e.message}`);
         }
-        if (!resp.ok) throw await errorOf(resp);
+        if (ok && !resp.ok) throw await errorOf(resp);
         return resp;
     };
     return {

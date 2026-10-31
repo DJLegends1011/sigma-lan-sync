@@ -14,6 +14,15 @@ const COUNT_WORDS = [
     ['chatsDeleted', 'chat to remove', 'chats to remove'],
     ['lorebooksChanged', 'lorebook', 'lorebooks'],
     ['lorebooksDeleted', 'lorebook to remove', 'lorebooks to remove'],
+    ['personasNew', 'new persona', 'new personas'],
+    ['personasChanged', 'changed persona', 'changed personas'],
+    ['personasDeleted', 'persona to remove', 'personas to remove'],
+    ['presetsNew', 'new preset', 'new presets'],
+    ['presetsChanged', 'changed preset', 'changed presets'],
+    ['presetsDeleted', 'preset to remove', 'presets to remove'],
+    ['playlistsNew', 'new playlist', 'new playlists'],
+    ['playlistsChanged', 'changed playlist', 'changed playlists'],
+    ['playlistsDeleted', 'playlist to remove', 'playlists to remove'],
 ];
 
 export function describeCounts(counts) {
@@ -286,6 +295,9 @@ export function createPanel(ctx) {
                 ${toggle('syncCharacters', 'Characters (cards, pictures, tags, galleries)')}
                 ${toggle('syncChats', 'Chats (messages, notes and unsent drafts)')}
                 ${toggle('syncLorebooks', 'Lorebooks')}
+                ${toggle('syncPersonas', 'Personas (names, descriptions, pronouns, pictures, lorebooks)')}
+                ${toggle('syncPresets', 'Prompt presets (blocks and ordering)')}
+                ${toggle('syncPlaylists', 'Playlists (folders and character memberships)')}
             </div>
             <div class="settings-row">
                 <label for="ls-mode">Sync mode</label>
@@ -508,7 +520,7 @@ export function createPanel(ctx) {
                     <section class="ls-section">
                         <h3 class="ls-heading">What a Sync Carries</h3>
                         <div data-ls-region="options"></div>
-                        <p class="ls-muted">Each device's connections, presets, personas and settings stay its own. A chat's own pictures do not travel yet.</p>
+                        <p class="ls-muted">Each device's connections and settings stay its own. A chat's own pictures do not travel yet.</p>
                     </section>
                 </div>`;
             body.addEventListener('click', (ev) => {

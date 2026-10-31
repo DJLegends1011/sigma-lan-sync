@@ -6,10 +6,11 @@
 // so it follows the source either way).
 
 export const chatKey = (c) => `${c.charId}\u0000${c.name}`;
+export const nameKey = (item) => String(item?.name || '').trim().toLowerCase();
 
 /**
- * @param {{characters: object[], chats: object[], worlds: object[]}} source the device pulled from
- * @param {{characters: object[], chats: object[], worlds: object[]}} target this library
+ * @param {{characters: object[], chats: object[], worlds: object[], personas?: object[], presets?: object[], playlists?: object[]}} source the device pulled from
+ * @param {{characters: object[], chats: object[], worlds: object[], personas?: object[], presets?: object[], playlists?: object[]}} target this library
  * @param {{datasets: string[], mode: 'incremental'|'mirror', overwrite: 'exact'|'prefer-newer'}} opts
  */
 export function makePlan(source, target, { datasets, mode, overwrite }) {
@@ -20,6 +21,9 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
         characters: { create: [], update: [], delete: [] },
         chats: { create: [], update: [], delete: [] },
         worlds: { put: [], delete: [] },
+        personas: { create: [], update: [], delete: [] },
+        presets: { create: [], update: [], delete: [] },
+        playlists: { create: [], update: [], delete: [] },
         kept: 0, // items the target kept because its own copy is newer
     };
 
@@ -78,6 +82,66 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
         if (mirror) plan.worlds.delete = target.worlds.filter(t => !sourceNames.has(t.name)).map(t => t.name);
     }
 
+    if (want.has('personas')) {
+        const srcList = source.personas || [];
+        const tgtList = target.personas || [];
+        const byId = new Map(tgtList.map(p => [p.id, p]));
+        const byName = new Map(tgtList.map(p => [nameKey(p), p]));
+        const matchedTargetIds = new Set();
+        for (const s of srcList) {
+            const t = byId.get(s.id) || byName.get(nameKey(s));
+            if (!t) {
+                plan.personas.create.push({ id: s.id, name: s.name });
+                continue;
+            }
+            matchedTargetIds.add(t.id);
+            if (t.digest === s.digest) continue;
+            if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) { plan.kept++; continue; }
+            plan.personas.update.push({ id: s.id, targetId: t.id, name: s.name });
+        }
+        if (mirror) plan.personas.delete = tgtList.filter(t => !matchedTargetIds.has(t.id)).map(t => t.id);
+    }
+
+    if (want.has('presets')) {
+        const srcList = source.presets || [];
+        const tgtList = target.presets || [];
+        const byId = new Map(tgtList.map(p => [p.id, p]));
+        const byName = new Map(tgtList.map(p => [nameKey(p), p]));
+        const matchedTargetIds = new Set();
+        for (const s of srcList) {
+            const t = byId.get(s.id) || byName.get(nameKey(s));
+            if (!t) {
+                plan.presets.create.push({ id: s.id, name: s.name });
+                continue;
+            }
+            matchedTargetIds.add(t.id);
+            if (t.digest === s.digest) continue;
+            if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) { plan.kept++; continue; }
+            plan.presets.update.push({ id: s.id, targetId: t.id, name: s.name });
+        }
+        if (mirror) plan.presets.delete = tgtList.filter(t => !matchedTargetIds.has(t.id)).map(t => t.id);
+    }
+
+    if (want.has('playlists')) {
+        const srcList = source.playlists || [];
+        const tgtList = target.playlists || [];
+        const byId = new Map(tgtList.map(p => [p.id, p]));
+        const byName = new Map(tgtList.map(p => [nameKey(p), p]));
+        const matchedTargetIds = new Set();
+        for (const s of srcList) {
+            const t = byId.get(s.id) || byName.get(nameKey(s));
+            if (!t) {
+                plan.playlists.create.push({ id: s.id, name: s.name, members: s.members || [] });
+                continue;
+            }
+            matchedTargetIds.add(t.id);
+            if (t.digest === s.digest) continue;
+            if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) { plan.kept++; continue; }
+            plan.playlists.update.push({ id: s.id, targetId: t.id, name: s.name, members: s.members || [], targetMembers: t.members || [] });
+        }
+        if (mirror) plan.playlists.delete = tgtList.filter(t => !matchedTargetIds.has(t.id)).map(t => t.id);
+    }
+
     return plan;
 }
 
@@ -108,6 +172,12 @@ export function alignSource(source, target, aliases = {}) {
             characters: source.characters.map(c => (kept[c.id] ? { ...c, id: kept[c.id], sourceId: c.id } : c)),
             chats: source.chats.map(c => (kept[c.charId] ? { ...c, charId: local(c.charId) } : c)),
             worlds: source.worlds,
+            personas: source.personas || [],
+            presets: source.presets || [],
+            playlists: (source.playlists || []).map(p => {
+                const members = (p.members || []).map(local);
+                return { ...p, members };
+            }),
         },
     };
 }
@@ -123,6 +193,15 @@ export function planCounts(plan) {
         chatsDeleted: plan.chats.delete.length,
         lorebooksChanged: plan.worlds.put.length,
         lorebooksDeleted: plan.worlds.delete.length,
+        personasNew: (plan.personas?.create || []).length,
+        personasChanged: (plan.personas?.update || []).length,
+        personasDeleted: (plan.personas?.delete || []).length,
+        presetsNew: (plan.presets?.create || []).length,
+        presetsChanged: (plan.presets?.update || []).length,
+        presetsDeleted: (plan.presets?.delete || []).length,
+        playlistsNew: (plan.playlists?.create || []).length,
+        playlistsChanged: (plan.playlists?.update || []).length,
+        playlistsDeleted: (plan.playlists?.delete || []).length,
         kept: plan.kept,
     };
 }
@@ -130,5 +209,8 @@ export function planCounts(plan) {
 export const planSize = (plan) => {
     const c = planCounts(plan);
     return c.charactersNew + c.charactersChanged + c.charactersDeleted + c.chatsNew + c.chatsChanged
-        + c.chatsDeleted + c.lorebooksChanged + c.lorebooksDeleted;
+        + c.chatsDeleted + c.lorebooksChanged + c.lorebooksDeleted
+        + c.personasNew + c.personasChanged + c.personasDeleted
+        + c.presetsNew + c.presetsChanged + c.presetsDeleted
+        + c.playlistsNew + c.playlistsChanged + c.playlistsDeleted;
 };

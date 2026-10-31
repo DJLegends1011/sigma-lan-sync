@@ -8,7 +8,7 @@ import { parsePairLink, buildPairLink } from '../client/pair-link.js';
 import { randomId, keyPair, deriveSecret, shortCode, hmac, safeEqual, verifySignature } from './crypto.js';
 import { makeStore, deviceName } from './store.js';
 import { localBase, localClient, peerClient, pairingCall, firstReachable, listenInfo, reachableAddresses, remoteIp } from './http.js';
-import { buildManifest, walk, chatRows, characterWorlds, DATASETS } from './manifest.js';
+import { buildManifest, walk, chatRows, characterWorlds, playlistMembers, DATASETS } from './manifest.js';
 import { runPull } from './sync.js';
 
 const PAIRING_TTL_MS = 10 * 60 * 1000;
@@ -34,6 +34,9 @@ export function register(router, ctx) {
         characters: ctx.setting(db, 'syncCharacters') !== false,
         chats: ctx.setting(db, 'syncChats') !== false,
         lorebooks: ctx.setting(db, 'syncLorebooks') !== false,
+        personas: ctx.setting(db, 'syncPersonas') !== false,
+        presets: ctx.setting(db, 'syncPresets') !== false,
+        playlists: ctx.setting(db, 'syncPlaylists') !== false,
         mode: ctx.setting(db, 'mode') === 'mirror' ? 'mirror' : 'incremental',
         overwrite: ctx.setting(db, 'overwrite') === 'prefer-newer' ? 'prefer-newer' : 'exact',
     });
@@ -380,6 +383,38 @@ export function register(router, ctx) {
         try { res.json(await local.json(`/api/worlds/${enc(req.params.name)}`)); } catch (e) { next(e); }
     });
 
+    router.get('/peer/persona/:id', signed, async (req, res, next) => {
+        const { local } = parts(req);
+        try {
+            const [persona, worlds] = await Promise.all([
+                local.json(`/api/personas/${enc(req.params.id)}`),
+                local.json(`/api/personas/${enc(req.params.id)}/worlds`),
+            ]);
+            res.json({ ...persona, worlds: Array.isArray(worlds) ? worlds : [] });
+        } catch (e) { next(e); }
+    });
+
+    router.get('/peer/persona/:id/avatar', signed, async (req, res, next) => {
+        const { local } = parts(req);
+        try { await relay(res, await local.request(`/persona-avatars/${enc(req.params.id)}.png`, { ok: false })); } catch (e) { next(e); }
+    });
+
+    router.get('/peer/preset/:id', signed, async (req, res, next) => {
+        const { local } = parts(req);
+        try { res.json(await local.json(`/api/presets/${enc(req.params.id)}`)); } catch (e) { next(e); }
+    });
+
+    router.get('/peer/playlist/:id', signed, async (req, res, next) => {
+        const { local } = parts(req);
+        try {
+            const doc = await local.json('/api/playlists');
+            const p = doc?.playlists?.[req.params.id];
+            if (!p) return res.status(404).json({ error: 'no such playlist' });
+            const members = await playlistMembers(local, req.params.id);
+            res.json({ id: req.params.id, ...p, members });
+        } catch (e) { next(e); }
+    });
+
     // "push", as TauriTavern does it: the other device asks this one to pull from it. The asker chooses what
     // to sync and how to overwrite; Mirror stays this device's own choice, since its deletions happen here.
     router.post('/peer/pull-request', signed, (req, res) => {
@@ -393,6 +428,9 @@ export function register(router, ctx) {
             characters: asked.characters !== false,
             chats: asked.chats !== false,
             lorebooks: asked.lorebooks !== false,
+            personas: asked.personas !== false,
+            presets: asked.presets !== false,
+            playlists: asked.playlists !== false,
             overwrite: asked.overwrite === 'prefer-newer' ? 'prefer-newer' : 'exact',
             mode: own.mode,
         };

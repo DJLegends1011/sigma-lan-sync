@@ -123,6 +123,43 @@ test('the desktop holds a library to sync', async () => {
     });
     assert.ok(chat.status < 300, JSON.stringify(chat.body));
     ids.deskChat = chat.body.id;
+
+    // Persona + bound lorebook + avatar
+    const persona = await desk.api('/personas', 'POST', {
+        name: 'Commander',
+        description: 'Fleet captain.',
+        pronouns: { sub: 'they', obj: 'them', poss: 'their', possP: 'theirs', ref: 'themselves' },
+    });
+    assert.equal(persona.status, 200, JSON.stringify(persona.body));
+    ids.deskPersona = persona.body.id;
+    const pWorlds = await desk.api(`/personas/${ids.deskPersona}/worlds`, 'PUT', { worlds: ['Nova Lore'] });
+    assert.equal(pWorlds.status, 200);
+    const png = Buffer.from(await (await fetch(`${desk.base}/avatars/${ids.nova}.png`)).arrayBuffer());
+    const pAv = await fetch(`${desk.base}/api/personas/${ids.deskPersona}/avatar`, { method: 'PUT', headers: { 'Content-Type': 'image/png' }, body: png });
+    assert.equal(pAv.status, 200);
+
+    // Preset
+    const preset = await desk.api('/presets', 'POST', {
+        name: 'Space Opera',
+        blocks: [
+            { key: 'main', name: 'Main', kind: 'text', content: 'Write space opera.', role: 'system', position: 'pre_history', enabled: true },
+            { key: 'chatHistory', name: 'History', kind: 'marker', marker: 'chatHistory', content: '', role: 'system', position: 'pre_history', enabled: true },
+        ],
+    });
+    assert.equal(preset.status, 200, JSON.stringify(preset.body));
+    ids.deskPreset = preset.body.id;
+
+    // Playlist with Nova & Iris
+    const playlist = await desk.api('/playlists', 'POST', {
+        name: 'Crew',
+        description: 'Bridge crew',
+        icon: 'fa-rocket',
+        color: '#4a9eff',
+    });
+    assert.equal(playlist.status, 200, JSON.stringify(playlist.body));
+    ids.deskPlaylist = playlist.body.id;
+    const plMem = await desk.api(`/playlists/${ids.deskPlaylist}/members/apply`, 'POST', { add: [ids.nova, ids.iris] });
+    assert.equal(plMem.status, 200, JSON.stringify(plMem.body));
 });
 
 test('the phone pairs with the desktop through its link and the code both screens show', async () => {
@@ -182,6 +219,9 @@ test('the phone pulls the whole library, ids and all', async () => {
     const counts = await dryRun(phone, deskId);
     assert.equal(counts.charactersNew, 2);
     assert.equal(counts.lorebooksChanged, 1);
+    assert.equal(counts.personasNew, 1);
+    assert.equal(counts.presetsNew, 1);
+    assert.equal(counts.playlistsNew, 1);
 
     await pull(phone, deskId);
     const nova = await phone.api(`/characters/${ids.nova}`);
@@ -192,6 +232,28 @@ test('the phone pulls the whole library, ids and all', async () => {
     assert.equal(chats[0].messageCount, 2);
     const world = await phone.api(`/worlds/${encodeURIComponent('Nova Lore')}`);
     assert.equal(world.status, 200);
+
+    // Check synced persona, preset, playlist
+    const personas = (await phone.api('/personas')).body.personas;
+    assert.equal(personas.length, 1);
+    assert.equal(personas[0].name, 'Commander');
+    assert.equal(personas[0].description, 'Fleet captain.');
+    assert.equal(personas[0].pronouns.sub, 'they');
+    assert.deepEqual(personas[0].worlds, ['Nova Lore']);
+    const pAv = await fetch(`${phone.base}/persona-avatars/${personas[0].id}.png`);
+    assert.equal(pAv.status, 200);
+
+    const presets = (await phone.api('/presets')).body.presets;
+    assert.equal(presets.length, 1);
+    assert.equal(presets[0].name, 'Space Opera');
+    assert.equal(presets[0].blocks[0].content, 'Write space opera.');
+
+    const playlistsDoc = (await phone.api('/playlists')).body;
+    const plId = playlistsDoc.order[0];
+    assert.equal(playlistsDoc.playlists[plId].name, 'Crew');
+    assert.equal(playlistsDoc.playlists[plId].count, 2);
+    const plMembers = (await phone.api(`/playlists/${plId}/members`)).body.ids;
+    assert.deepEqual(plMembers, [ids.nova, ids.iris]);
 
     // and a second look finds nothing left to do: the two libraries digest the same
     assert.deepEqual(nothingToDo(await dryRun(phone, deskId)), []);

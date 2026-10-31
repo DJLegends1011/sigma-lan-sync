@@ -3,7 +3,7 @@
 // clock, so times alone would see every synced item as changed again on the next pass.
 import { canon, sha256 } from './crypto.js';
 
-export const DATASETS = ['characters', 'chats', 'lorebooks'];
+export const DATASETS = ['characters', 'chats', 'lorebooks', 'personas', 'presets', 'playlists'];
 const PAGE = 1000;
 const CONCURRENCY = 6;
 
@@ -59,6 +59,34 @@ export async function chatRows(local, id, signal) {
     }
 }
 
+/** A playlist's member character ids in order, walking nextCursor. */
+export async function playlistMembers(local, id, signal) {
+    const ids = [];
+    let after = null;
+    do {
+        const page = await local.json(`/api/playlists/${encodeURIComponent(id)}/members?limit=1000${after ? `&after=${encodeURIComponent(after)}` : ''}`, { signal });
+        ids.push(...(page.ids || []));
+        after = page.nextCursor || null;
+    } while (after);
+    return ids;
+}
+
+/** Normalized blocks of a preset for content hashing and transfer (strip row-specific block ids). */
+export const presetBlocksContent = (blocks) => (Array.isArray(blocks) ? blocks : []).map((b, i) => ({
+    key: b.key ?? null,
+    name: b.name ?? null,
+    kind: b.kind === 'marker' ? 'marker' : 'text',
+    marker: b.kind === 'marker' ? (b.marker ?? null) : null,
+    content: typeof b.content === 'string' ? b.content : '',
+    role: b.role || 'system',
+    position: b.position || 'pre_history',
+    depth: Number.isInteger(b.depth) ? b.depth : 0,
+    injectionOrder: Number.isInteger(b.injectionOrder) ? b.injectionOrder : 100,
+    forbidOverrides: !!b.forbidOverrides,
+    enabled: b.enabled !== false,
+    pos: i,
+}));
+
 // a lorebook's content is its data ({entries, ...meta}); the rest of its answer is the shelf's bookkeeping
 export const worldContent = (doc) => doc?.data ?? {};
 
@@ -76,8 +104,8 @@ const cardContent = (card) => {
 export async function buildManifest(local, store, { datasets, signal, onProgress = () => {} }) {
     const want = new Set(datasets);
     const cache = store.digestCache();
-    const fresh = { chars: {}, chats: {} };
-    const manifest = { characters: [], chats: [], worlds: [] };
+    const fresh = { chars: {}, chats: {}, personas: {} };
+    const manifest = { characters: [], chats: [], worlds: [], personas: [], presets: [], playlists: [] };
 
     if (want.has('characters') || want.has('chats')) {
         const rows = await walk(local, '/api/characters?sort=name', signal);
@@ -143,10 +171,90 @@ export async function buildManifest(local, store, { datasets, signal, onProgress
         }, signal);
     }
 
+    if (want.has('personas')) {
+        onProgress('Scanning personas');
+        const { personas = [] } = await local.json('/api/personas', { signal });
+        await eachLimited(personas, CONCURRENCY, async (p) => {
+            const id = p.id;
+            const enc = encodeURIComponent(id);
+            const head = await local.request(`/persona-avatars/${enc}.png`, { method: 'HEAD', signal, ok: false });
+            const etag = head.ok ? head.headers.get('etag') || '' : '';
+            let avatar = cache.personas?.[id]?.etag === etag && etag ? cache.personas[id].avatar : null;
+            if (avatar == null) {
+                if (!head.ok) avatar = '';
+                else {
+                    const img = await local.request(`/persona-avatars/${enc}.png`, { signal, ok: false });
+                    avatar = img.ok ? sha256(Buffer.from(await img.arrayBuffer())) : '';
+                }
+            }
+            fresh.personas[id] = { etag, avatar };
+            manifest.personas.push({
+                id,
+                name: p.name || '',
+                updatedAt: p.updatedAt ?? 0,
+                hasAvatar: !!avatar,
+                digest: sha256(canon({
+                    name: p.name || '',
+                    description: p.description || '',
+                    pronouns: p.pronouns || {},
+                    worlds: Array.isArray(p.worlds) ? p.worlds : [],
+                    avatar,
+                })),
+            });
+        }, signal);
+    }
+
+    if (want.has('presets')) {
+        onProgress('Scanning presets');
+        const { presets = [] } = await local.json('/api/presets', { signal });
+        for (const p of presets) {
+            manifest.presets.push({
+                id: p.id,
+                name: p.name || '',
+                updatedAt: p.updatedAt ?? 0,
+                digest: sha256(canon({
+                    name: p.name || '',
+                    blocks: presetBlocksContent(p.blocks),
+                })),
+            });
+        }
+    }
+
+    if (want.has('playlists')) {
+        onProgress('Scanning playlists');
+        const doc = await local.json('/api/playlists', { signal });
+        const order = Array.isArray(doc?.order) ? doc.order : Object.keys(doc?.playlists || {});
+        await eachLimited(order, CONCURRENCY, async (id) => {
+            const p = doc.playlists?.[id];
+            if (!p) return;
+            const members = await playlistMembers(local, id, signal);
+            manifest.playlists.push({
+                id,
+                name: p.name || '',
+                updatedAt: p.modified ?? p.created ?? 0,
+                members,
+                meta: sha256(canon({
+                    name: p.name || '',
+                    description: p.description || '',
+                    icon: p.icon || '',
+                    color: p.color || '',
+                })),
+                digest: sha256(canon({
+                    name: p.name || '',
+                    description: p.description || '',
+                    icon: p.icon || '',
+                    color: p.color || '',
+                    members,
+                })),
+            });
+        }, signal);
+    }
+
     // keep what this scan read alongside what it did not (a dataset left out this time)
     store.saveDigestCache({
         chars: want.has('characters') || want.has('chats') ? fresh.chars : cache.chars,
         chats: want.has('chats') ? fresh.chats : cache.chats,
+        personas: want.has('personas') ? fresh.personas : (cache.personas || {}),
     });
     return manifest;
 }

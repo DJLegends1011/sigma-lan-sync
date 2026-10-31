@@ -21,12 +21,14 @@ both devices. Each device needs to listen on the network: `host: 0.0.0.0` in `da
 What a sync carries, and how, is set in the panel:
 
 - **Characters** (card, picture, tags, favourite, linked lorebooks and new gallery items), **Chats** (messages,
-  Author's Note and other chat settings, and the unsent draft) and **Lorebooks**.
+  Author's Note and other chat settings, and the unsent draft), **Lorebooks**, **Personas** (names, descriptions,
+  pronouns, pictures and bound lorebooks), **Prompt presets** (blocks and ordering), and **Playlists** (folders and
+  character memberships).
 - **Incremental** brings in what is new or changed. **Mirror** also removes what the other device does not have.
 - **Exact** lets the device you sync from win. **Prefer newer** keeps this device's edit when its own clock says it
   is newer.
 
-Each device's connections, presets, personas and settings stay its own.
+Each device's connections and settings stay its own.
 
 ## How it works
 
