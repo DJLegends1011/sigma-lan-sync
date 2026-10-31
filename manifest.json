@@ -1,7 +1,7 @@
 {
     "id": "lan-sync",
     "name": "LAN Sync",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "author": "DJLegends",
     "description": "Keeps two Project Σ installs in step over your network, the way TauriTavern's LAN Sync does: pair a phone and a desktop by scanning a QR code, then pull or push characters, chats and lorebooks between them. Needs a server without accounts.",
     "requires": { "api": "2.5" },

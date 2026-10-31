@@ -28,19 +28,27 @@ export function listenInfo(req) {
 const isOverlay = (ip) => { const [a, b] = ip.split('.').map(Number); return a === 100 && b >= 64 && b <= 127; };
 const isPrivate = (ip) => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip);
 
-/** The IPv4 addresses another device may reach this one by, network addresses first. */
+// adapters that carry no home network: virtual switches, game LANs, VPNs a phone is not on
+const VIRTUAL_IFACE = /vethernet|hyper-?v|wsl|virtualbox|vmware|vbox|docker|loopback|xlink|radmin|hamachi|zerotier|\btap\b|\btun\b|vpn|bluetooth/i;
+const PHYSICAL_IFACE = /wi-?fi|wlan|wireless|^en\d|^eth\d|^ethernet/i;
+
+/**
+ * The IPv4 addresses another device may reach this one by, the likeliest first: a real Wi-Fi or Ethernet
+ * adapter's home address, then other private ones, then an overlay network (Tailscale), virtual adapters last.
+ */
 export function reachableAddresses(port) {
     const out = [];
     for (const [iface, addrs] of Object.entries(os.networkInterfaces())) {
         for (const a of addrs || []) {
             if (a.family !== 'IPv4' || a.internal) continue;
             if (a.address.startsWith('169.254.')) continue;
-            const kind = isOverlay(a.address) ? 'overlay' : isPrivate(a.address) ? 'lan' : 'other';
-            out.push({ address: `${a.address}:${port}`, ip: a.address, iface, kind });
+            const kind = isOverlay(a.address) ? 'overlay' : VIRTUAL_IFACE.test(iface) ? 'virtual' : isPrivate(a.address) ? 'lan' : 'other';
+            let score = { lan: 0, overlay: 20, other: 30, virtual: 40 }[kind];
+            if (kind === 'lan') score += (PHYSICAL_IFACE.test(iface) ? 0 : 5) + (a.address.startsWith('192.168.') ? 0 : 1);
+            out.push({ address: `${a.address}:${port}`, ip: a.address, iface, kind, score });
         }
     }
-    const rank = { lan: 0, overlay: 1, other: 2 };
-    return out.sort((x, y) => rank[x.kind] - rank[y.kind]);
+    return out.sort((x, y) => x.score - y.score).map(({ score, ...a }) => a);
 }
 
 async function errorOf(resp) {
@@ -100,6 +108,27 @@ export function peerClient({ address, deviceId, secret }) {
         request,
         json: async (path, opts) => (await request(path, opts)).json(),
     };
+}
+
+/**
+ * The first of these host:port addresses whose Σ answers, all asked at once (an unreachable one costs a timeout
+ * only when nothing else answers). Answers null when none does.
+ */
+export async function firstReachable(addresses, { timeout = 3000, signal } = {}) {
+    const race = new AbortController();
+    const stop = signal ? AbortSignal.any([signal, race.signal]) : race.signal;
+    try {
+        return await Promise.any(addresses.map(async (address) => {
+            const resp = await fetch(`http://${address}/api/health`, { signal: withTimeout(stop, timeout) });
+            const body = resp.ok ? await resp.json().catch(() => null) : null;
+            if (body?.name !== 'project-sigma') throw new Error('not a Project Σ');
+            return address;
+        }));
+    } catch {
+        return null;
+    } finally {
+        race.abort();
+    }
 }
 
 /** An unsigned call to another device's pairing routes, which answer only to the pairing code. */

@@ -52,7 +52,7 @@ Each device's connections, presets, personas and settings stay its own.
 ## Tests
 
 ```
-node --test test/plan.test.mjs
+node --test test/plan.test.mjs test/http.test.mjs
 node --test test/two-devices.test.mjs   # boots two real Σ servers; set SIGMA_DIR to your Σ checkout
 ```
 

@@ -7,7 +7,7 @@ import { Readable } from 'node:stream';
 import { parsePairLink, buildPairLink } from '../client/pair-link.js';
 import { randomId, keyPair, deriveSecret, shortCode, hmac, safeEqual, verifySignature } from './crypto.js';
 import { makeStore, deviceName } from './store.js';
-import { localBase, localClient, peerClient, pairingCall, listenInfo, reachableAddresses, remoteIp } from './http.js';
+import { localBase, localClient, peerClient, pairingCall, firstReachable, listenInfo, reachableAddresses, remoteIp } from './http.js';
 import { buildManifest, walk, chatRows, characterWorlds, DATASETS } from './manifest.js';
 import { runPull } from './sync.js';
 
@@ -75,7 +75,10 @@ export function register(router, ctx) {
         const { me, name, port } = parts(req);
         // a server bound to loopback can still pair with another Σ on this same machine
         const loopbackOnly = listenInfo(req).loopbackOnly;
-        const addresses = loopbackOnly ? [`127.0.0.1:${port}`] : reachableAddresses(port).map(a => a.address);
+        // virtual adapters ride the code only when nothing better exists; three addresses keep the code small
+        const ranked = reachableAddresses(port);
+        const usable = ranked.filter(a => a.kind !== 'virtual');
+        const addresses = loopbackOnly ? [`127.0.0.1:${port}`] : (usable.length ? usable : ranked).slice(0, 3).map(a => a.address);
         if (!addresses.length) return res.status(409).json({ error: 'This machine has no network address another device could reach' });
         const warning = loopbackOnly
             ? 'This Σ only listens on this machine, so only another Σ on this machine can pair. Set host to 0.0.0.0 in data/server.yaml (or CL_HOST) and restart it to pair a phone.'
@@ -172,26 +175,24 @@ export function register(router, ctx) {
         const line = (obj) => res.write(`${JSON.stringify(obj)}\n`);
 
         const keys = keyPair();
-        let address = null;
-        let requestId = null;
-        const reasons = [];
-        for (const candidate of offer.addresses) {
-            line({ step: 'contacting', address: candidate });
-            try {
-                const answer = await pairingCall(candidate, '/peer/pair/request', {
-                    code: offer.code, device: { id: me.deviceId, name }, key: keys.publicKey, port,
-                }, { timeout: 4000, signal: hangUp.signal });
-                address = candidate;
-                requestId = answer.requestId;
-                break;
-            } catch (e) {
-                if (hangUp.signal.aborted) return;
-                reasons.push(`${candidate}: ${e.message}`);
-                // the device answered and refused: another address would answer the same
-                if (e.status) break;
-            }
+        // every address the code names is asked at once; the first Σ to answer is the one paired with
+        line({ step: 'contacting', name: offer.name });
+        const address = await firstReachable(offer.addresses, { signal: hangUp.signal });
+        if (hangUp.signal.aborted) return;
+        if (!address) {
+            return res.end(`${JSON.stringify({ error: `Could not reach ${offer.name} at ${offer.addresses.join(', ')}. Check both devices are on the same network.` })}\n`);
         }
-        if (!address) return res.end(`${JSON.stringify({ error: `Could not pair with ${offer.name}. ${reasons.join('; ')}` })}\n`);
+        line({ step: 'reached', address });
+        let requestId;
+        try {
+            const answer = await pairingCall(address, '/peer/pair/request', {
+                code: offer.code, device: { id: me.deviceId, name }, key: keys.publicKey, port,
+            }, { timeout: 5000, signal: hangUp.signal });
+            requestId = answer.requestId;
+        } catch (e) {
+            if (hangUp.signal.aborted) return;
+            return res.end(`${JSON.stringify({ error: `${offer.name} refused the pairing: ${e.message}` })}\n`);
+        }
 
         line({ step: 'confirm', name: offer.name, code: shortCode(offer.key, keys.publicKey, offer.code) });
         while (!hangUp.signal.aborted) {

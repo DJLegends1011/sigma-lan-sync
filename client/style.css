@@ -108,7 +108,8 @@
     border: 1px solid var(--glass-border);
 }
 .ls-peer-head { display: flex; align-items: center; gap: var(--space-sm); color: var(--text-primary); }
-.ls-peer-name { display: flex; flex-direction: column; min-width: 0; }
+.ls-peer-name { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.ls-peer-remove { flex-shrink: 0; }
 .ls-link {
     all: unset;
     cursor: pointer;
@@ -121,6 +122,9 @@
 .cl-btn.ls-danger:hover { color: var(--cl-error); }
 
 @media (max-width: 600px) {
+    /* a phone's width goes to the content: the boxes inside boxes give back their padding */
+    .ls-section { padding: var(--space-sm-md) var(--space-sm); }
+    .ls-peer { padding: var(--space-sm); }
     .ls-offer { grid-template-columns: minmax(0, 1fr); }
     .ls-qr { max-width: 280px; justify-self: center; width: 100%; }
 }

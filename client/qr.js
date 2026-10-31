@@ -39,6 +39,15 @@ export function cameraBlocker() {
     return null;
 }
 
+/** The browser's camera permission for this site ('granted', 'denied', 'prompt'), or null when it will not say. */
+export async function cameraPermission() {
+    try {
+        return (await navigator.permissions.query({ name: 'camera' })).state;
+    } catch {
+        return null;
+    }
+}
+
 async function makeDetector(video) {
     if ('BarcodeDetector' in window) {
         try {

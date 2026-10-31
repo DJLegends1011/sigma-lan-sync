@@ -1,7 +1,7 @@
 // The Sync panel: this device, pairing (show a code, or scan one), the paired devices and what a sync
 // carries. Its regions paint on their own, so a status refresh never wipes a field being typed in or the
 // camera's picture.
-import { qrSvg, startScanner, cameraBlocker } from './qr.js';
+import { qrSvg, startScanner, cameraBlocker, cameraPermission } from './qr.js';
 
 const POLL_MS = 1500;
 
@@ -116,7 +116,8 @@ export function createPanel(ctx) {
         }
         if (join) {
             const shown = join.lines.map((l) => {
-                if (l.step === 'contacting') return `<p class="ls-muted">Reaching ${esc(l.address)}...</p>`;
+                if (l.step === 'contacting') return `<p class="ls-muted">Looking for ${esc(l.name)} on the network...</p>`;
+                if (l.step === 'reached') return `<p class="ls-muted">Found it at ${esc(l.address)}.</p>`;
                 if (l.step === 'confirm') return `<p class="ls-line">Check that <strong>${esc(l.name)}</strong> shows <span class="ls-code">${esc(l.code.slice(0, 3))} ${esc(l.code.slice(3))}</span>, then allow it there.</p>`;
                 if (l.step === 'paired') return `<p class="ls-line is-success"><i class="fa-solid fa-circle-check" aria-hidden="true"></i> Paired with ${esc(l.name)}.</p>`;
                 return '';
@@ -140,23 +141,29 @@ export function createPanel(ctx) {
                     <div class="settings-row">
                         <label class="ls-muted" for="ls-paste">Or paste the pairing link</label>
                         <div class="ls-paste-row">
-                            <input id="ls-paste" type="search" autocomplete="off" class="glass-input" data-ls="paste" placeholder="http://localhost:7788/?lan-sync-pair=...">
+                            <input id="ls-paste" type="search" autocomplete="off" class="glass-input" data-ls="paste" placeholder="http://localhost:7788/library.html?lan-sync-pair=...">
                             <button type="button" class="cl-btn cl-btn-sm cl-btn-primary" data-ls-act="pair-pasted">Pair</button>
                         </div>
                     </div>
                     <div class="ls-verbs"><button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-act="stop-scan">Cancel</button></div>
                 </div>`;
             if (!blocker) {
-                startScanner(el.querySelector('[data-ls="video"]'), (text) => { stopScan = null; scanning = false; beginJoin(text); })
-                    .then((stop) => { if (scanning) stopScan = stop; else stop(); })
-                    .catch((e) => {
-                        const v = el.querySelector('[data-ls="video"]');
-                        const denied = e?.name === 'NotAllowedError';
-                        v?.insertAdjacentHTML('afterend', `<p class="ls-line is-warning">${denied
-                            ? 'This page may not use the camera. Use your Camera app as above, allow the camera in this site\'s settings, or paste the link below.'
-                            : `The camera did not start (${esc(why(e))}). Use your Camera app as above, or paste the link below.`}</p>`);
-                        v?.remove();
-                    });
+                const video = el.querySelector('[data-ls="video"]');
+                const instead = (html) => {
+                    video?.insertAdjacentHTML('afterend', `<p class="ls-line is-warning">${html}</p>`);
+                    video?.remove();
+                };
+                // a browser that already said no for this site refuses again without asking: say where to undo it
+                const blocked = 'The browser has the camera blocked for this site, so it will not ask. In Chrome, tap the icon left of the address, then <strong>Permissions</strong>, then <strong>Camera</strong>, and allow it (an installed Σ app shares that setting). Or use your Camera app as above, or paste the link below.';
+                cameraPermission().then((state) => {
+                    if (!scanning || !video?.isConnected) return;
+                    if (state === 'denied') { instead(blocked); return; }
+                    startScanner(video, (text) => { stopScan = null; scanning = false; beginJoin(text); })
+                        .then((stop) => { if (scanning) stopScan = stop; else stop(); })
+                        .catch((e) => instead(e?.name === 'NotAllowedError'
+                            ? blocked
+                            : `The camera did not start (${esc(why(e))}). Use your Camera app as above, or paste the link below.`));
+                });
             }
             return;
         }
@@ -226,6 +233,7 @@ export function createPanel(ctx) {
                             <strong>${esc(p.name)}</strong>
                             <button type="button" class="ls-link" data-ls-act="edit-address" data-id="${esc(p.id)}" title="Change its address">${esc(p.address)}</button>
                         </div>
+                        <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary ls-danger ls-peer-remove" data-ls-act="remove" data-id="${esc(p.id)}" title="Unpair" aria-label="Unpair ${esc(p.name)}"><i class="fa-solid fa-link-slash" aria-hidden="true"></i></button>
                     </div>
                     <p class="ls-muted">${last}</p>
                     ${checks.has(p.id) ? `<p class="ls-line">${esc(checks.get(p.id))}</p>` : ''}
@@ -234,7 +242,6 @@ export function createPanel(ctx) {
                         <button type="button" class="cl-btn cl-btn-sm cl-btn-primary" data-ls-act="pull" data-id="${esc(p.id)}"${busy ? ' disabled' : ''}><i class="fa-solid fa-download" aria-hidden="true"></i> Sync From It</button>
                         <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-act="push" data-id="${esc(p.id)}"><i class="fa-solid fa-upload" aria-hidden="true"></i> Send to It</button>
                         <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-act="check" data-id="${esc(p.id)}"${busy ? ' disabled' : ''}><i class="fa-solid fa-magnifying-glass" aria-hidden="true"></i> Check</button>
-                        <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary ls-danger" data-ls-act="remove" data-id="${esc(p.id)}" title="Unpair"><i class="fa-solid fa-link-slash" aria-hidden="true"></i></button>
                     </div>
                 </div>`;
         }).join('');
