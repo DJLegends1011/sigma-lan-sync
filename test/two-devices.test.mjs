@@ -129,6 +129,9 @@ test('the phone pairs with the desktop through its link and the code both screen
     const offer = await desk.ext('/pairing/start', 'POST', {});
     assert.equal(offer.status, 200, JSON.stringify(offer.body));
     assert.match(offer.body.link, /lan-sync-pair=/);
+    // a camera app opens the link as it is: the page must load with the pairing still in its query
+    const opened = await fetch(offer.body.link.replace(/^http:\/\/localhost:\d+/, phone.base), { redirect: 'manual' });
+    assert.equal(opened.status, 200, 'the link opens the page directly, no redirect to drop its query');
 
     const resp = await fetch(`${phone.base}/api/ext/lan-sync/pairing/join`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ link: offer.body.link }),

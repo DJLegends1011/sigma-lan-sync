@@ -85,7 +85,8 @@ test('an alias updates by the source id, and a stale one is dropped', () => {
 test('a pairing link round-trips, and junk is refused', () => {
     const offer = { id: 'dev1', name: 'Desk', addresses: ['192.168.1.20:7788'], code: 'abc', expiresAt: 123, key: 'k'.repeat(43) };
     const link = buildPairLink(offer, 7788);
-    assert.match(link, /^http:\/\/localhost:7788\/\?lan-sync-pair=/);
+    // the page, not the root, whose redirect drops the query
+    assert.match(link, /^http:\/\/localhost:7788\/library\.html\?lan-sync-pair=/);
     assert.deepEqual(parsePairLink(link), offer);
     assert.deepEqual(parsePairLink(`scanned: ${link}`), offer);
     assert.equal(parsePairLink('https://example.com'), null);

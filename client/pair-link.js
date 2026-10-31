@@ -33,7 +33,8 @@ export function buildPairLink(offer, port = 7788) {
         k: offer.key,
     };
     const encoded = toBase64Url(new TextEncoder().encode(JSON.stringify(payload)));
-    return `http://localhost:${port}/?${PAIR_PARAM}=${encoded}`;
+    // the page itself, not the root: the root redirects to it and drops the query on the way
+    return `http://localhost:${port}/library.html?${PAIR_PARAM}=${encoded}`;
 }
 
 /**

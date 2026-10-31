@@ -91,7 +91,7 @@ export function createPanel(ctx) {
                 <div class="ls-offer">
                     <div class="ls-qr">${qrSvg(offer.link)}</div>
                     <div class="ls-offer-side">
-                        <p class="ls-line">On the other device, open LAN Sync and choose <strong>Scan a Code</strong>, or point its camera here.</p>
+                        <p class="ls-line">Point the other device's <strong>Camera app</strong> (or Google Lens) at this code and open the link it finds: it opens that device's own Σ with the pairing filled in. Or open LAN Sync there and choose <strong>Scan a Code</strong>.</p>
                         <p class="ls-muted" data-ls="countdown">Expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}</p>
                         <div class="ls-requests">${requests.length ? requests.map(r => `
                             <div class="ls-request">
@@ -135,6 +135,7 @@ export function createPanel(ctx) {
             const blocker = cameraBlocker();
             el.innerHTML = `
                 <div class="ls-scan">
+                    <p class="ls-muted">Quickest on a phone: scan the other device's code with your <strong>Camera app</strong> or Google Lens and open the link. It lands here with the pairing filled in.</p>
                     ${blocker ? `<p class="ls-line is-warning">${esc(blocker)}</p>` : '<video class="ls-video" data-ls="video" aria-label="Camera"></video>'}
                     <div class="settings-row">
                         <label class="ls-muted" for="ls-paste">Or paste the pairing link</label>
@@ -150,7 +151,10 @@ export function createPanel(ctx) {
                     .then((stop) => { if (scanning) stopScan = stop; else stop(); })
                     .catch((e) => {
                         const v = el.querySelector('[data-ls="video"]');
-                        v?.insertAdjacentHTML('afterend', `<p class="ls-line is-error">The camera did not start (${esc(why(e))}). Allow camera access for this page, or paste the link below.</p>`);
+                        const denied = e?.name === 'NotAllowedError';
+                        v?.insertAdjacentHTML('afterend', `<p class="ls-line is-warning">${denied
+                            ? 'This page may not use the camera. Use your Camera app as above, allow the camera in this site\'s settings, or paste the link below.'
+                            : `The camera did not start (${esc(why(e))}). Use your Camera app as above, or paste the link below.`}</p>`);
                         v?.remove();
                     });
             }
