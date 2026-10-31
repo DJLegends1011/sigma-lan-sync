@@ -1,9 +1,9 @@
 {
     "id": "lan-sync",
     "name": "LAN Sync",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "author": "DJLegends",
-    "description": "Keeps two Project Σ installs in step over your network, the way TauriTavern's LAN Sync does: pair a phone and a desktop by scanning a QR code, then pull or push characters, chats, lorebooks, personas, presets and playlists between them. Needs a server without accounts.",
+    "description": "Keeps two Project Σ installs in step over your network via direct SQLite database + media sync: pair a phone and a desktop by scanning a QR code, then pull or push characters, chats (with attachments), lorebooks, personas, presets, playlists, backgrounds and connections between them.",
     "requires": { "api": "2.5" },
     "settings": {
         "deviceName": "",
@@ -13,6 +13,8 @@
         "syncPersonas": true,
         "syncPresets": true,
         "syncPlaylists": true,
+        "syncBackgrounds": true,
+        "syncConnections": false,
         "mode": "incremental",
         "overwrite": "exact"
     },

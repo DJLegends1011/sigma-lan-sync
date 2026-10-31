@@ -3,13 +3,14 @@
 //   pairing (/peer/pair/*: unsigned, answering only to a live pairing code),
 //   peer (/peer/*: signed with a paired device's secret, read-only views of this library).
 // A paired device can read this library and ask it to pull; nothing a peer sends writes here directly.
+import fs from 'node:fs';
 import { Readable } from 'node:stream';
 import { parsePairLink, buildPairLink } from '../client/pair-link.js';
 import { randomId, keyPair, deriveSecret, shortCode, hmac, safeEqual, verifySignature } from './crypto.js';
 import { makeStore, deviceName } from './store.js';
 import { localBase, localClient, peerClient, pairingCall, firstReachable, listenInfo, reachableAddresses, remoteIp } from './http.js';
-import { buildManifest, walk, chatRows, characterWorlds, playlistMembers, DATASETS } from './manifest.js';
-import { runPull } from './sync.js';
+import { buildManifestFromDb, buildFileManifest, walk, chatRows, characterWorlds, playlistMembers, DATASETS } from './manifest.js';
+import { runPull, createDbSnapshot, resolveMediaFile } from './sync.js';
 
 const PAIRING_TTL_MS = 10 * 60 * 1000;
 const MAX_PENDING = 5;
@@ -37,6 +38,8 @@ export function register(router, ctx) {
         personas: ctx.setting(db, 'syncPersonas') !== false,
         presets: ctx.setting(db, 'syncPresets') !== false,
         playlists: ctx.setting(db, 'syncPlaylists') !== false,
+        backgrounds: ctx.setting(db, 'syncBackgrounds') !== false,
+        connections: ctx.setting(db, 'syncConnections') === true,
         mode: ctx.setting(db, 'mode') === 'mirror' ? 'mirror' : 'incremental',
         overwrite: ctx.setting(db, 'overwrite') === 'prefer-newer' ? 'prefer-newer' : 'exact',
     });
@@ -244,14 +247,16 @@ export function register(router, ctx) {
     });
 
     const startPull = (req, peerRecord, options, label) => {
-        const { store, me, local } = parts(req);
+        const { store, me } = parts(req);
+        const db = req.db;
+        const paths = req.paths;
         const peer = peerClient({ address: peerRecord.address, deviceId: me.deviceId, secret: peerRecord.secret });
-        return ctx.jobs.run(req.db, {
+        return ctx.jobs.run(db, {
             key: `pull-${peerRecord.id}`,
             label,
             run: async ({ signal, progress }) => {
                 const aliases = store.peer(peerRecord.id)?.aliases || {};
-                const result = await runPull({ local, peer, store, options, aliases, signal, progress });
+                const result = await runPull({ db, paths, ctx, peer, store, options, aliases, signal, progress });
                 store.updatePeer(peerRecord.id, {
                     aliases: result.aliases,
                     lastSync: { at: Date.now(), direction: 'pull', counts: result.counts, errors: result.errors.slice(0, 20) },
@@ -264,14 +269,14 @@ export function register(router, ctx) {
     };
 
     router.post('/peers/:id/pull', async (req, res) => {
-        const { store, me, local } = parts(req);
+        const { store, me } = parts(req);
         const record = store.peer(req.params.id);
         if (!record) return res.status(404).json({ error: 'No such paired device' });
         const options = syncOptions(req.db);
         if (req.body?.dryRun) {
             const peer = peerClient({ address: record.address, deviceId: me.deviceId, secret: record.secret });
             try {
-                const { counts } = await runPull({ local, peer, store, aliases: record.aliases || {}, options: { ...options, dryRun: true } });
+                const { counts } = await runPull({ db: req.db, paths: req.paths, ctx, peer, store, aliases: record.aliases || {}, options: { ...options, dryRun: true } });
                 return res.json({ counts, options });
             } catch (e) {
                 return res.status(502).json({ error: e.message });
@@ -328,11 +333,62 @@ export function register(router, ctx) {
     });
 
     router.post('/peer/manifest', signed, async (req, res, next) => {
-        const { store, local } = parts(req);
+        const { store } = parts(req);
         const datasets = (Array.isArray(req.body?.datasets) ? req.body.datasets : DATASETS).filter(d => DATASETS.includes(d));
         try {
-            res.json(await buildManifest(local, store, { datasets }));
+            res.json(buildManifestFromDb(req.db, req.paths, store, { datasets }));
         } catch (e) { next(e); }
+    });
+
+    router.post('/peer/db-snapshot', signed, (req, res, next) => {
+        const includeConnections = req.body?.includeConnections === true;
+        let tmpFile = null;
+        try {
+            tmpFile = createDbSnapshot(req.db, { includeConnections });
+            const stat = fs.statSync(tmpFile);
+            res.setHeader('Content-Type', 'application/x-sqlite3');
+            res.setHeader('Content-Length', String(stat.size));
+            const stream = fs.createReadStream(tmpFile);
+            const cleanup = () => {
+                if (tmpFile) {
+                    const f = tmpFile;
+                    tmpFile = null;
+                    try { fs.unlinkSync(f); } catch { /* ignore */ }
+                }
+            };
+            res.on('close', cleanup);
+            stream.on('end', cleanup);
+            stream.on('error', (err) => { cleanup(); next(err); });
+            stream.pipe(res);
+        } catch (e) {
+            if (tmpFile) { try { fs.unlinkSync(tmpFile); } catch { /* ignore */ } }
+            next(e);
+        }
+    });
+
+    router.post('/peer/files-manifest', signed, (req, res, next) => {
+        const datasets = (Array.isArray(req.body?.datasets) ? req.body.datasets : DATASETS).filter(d => DATASETS.includes(d));
+        try {
+            res.json({ files: buildFileManifest(req.db, req.paths, { datasets }) });
+        } catch (e) { next(e); }
+    });
+
+    router.get('/peer/file/:kind', signed, (req, res) => {
+        const relPath = String(req.query.path || '');
+        const fullPath = resolveMediaFile(req.paths, req.params.kind, relPath);
+        if (!fullPath) return res.status(400).json({ error: 'Invalid media file path' });
+        let stat;
+        try {
+            stat = fs.statSync(fullPath);
+            if (!stat.isFile()) return res.status(404).json({ error: 'Not a file' });
+        } catch {
+            return res.status(404).json({ error: 'File not found' });
+        }
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', String(stat.size));
+        const stream = fs.createReadStream(fullPath);
+        res.on('close', () => stream.destroy());
+        stream.pipe(res);
     });
 
     router.post('/peer/bundle', signed, async (req, res, next) => {
@@ -431,6 +487,8 @@ export function register(router, ctx) {
             personas: asked.personas !== false,
             presets: asked.presets !== false,
             playlists: asked.playlists !== false,
+            backgrounds: asked.backgrounds !== false,
+            connections: asked.connections === true && own.connections === true,
             overwrite: asked.overwrite === 'prefer-newer' ? 'prefer-newer' : 'exact',
             mode: own.mode,
         };

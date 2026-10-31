@@ -1,11 +1,10 @@
-// A library's manifest: one digest per character, chat and lorebook, the way TauriTavern's manifest holds a
-// size and a time per file. Digests hash content, not times: a synced write stamps the receiving device's own
-// clock, so times alone would see every synced item as changed again on the next pass.
+// A library's manifest, read straight from SQLite (req.db) and the disk folders (req.paths).
+import fs from 'node:fs';
+import path from 'node:path';
 import { canon, sha256 } from './crypto.js';
 
-export const DATASETS = ['characters', 'chats', 'lorebooks', 'personas', 'presets', 'playlists'];
+export const DATASETS = ['characters', 'chats', 'lorebooks', 'personas', 'presets', 'playlists', 'backgrounds', 'connections'];
 const PAGE = 1000;
-const CONCURRENCY = 6;
 
 /** Run fn over items, a few at a time, in order of completion. */
 export async function eachLimited(items, limit, fn, signal) {
@@ -21,12 +20,12 @@ export async function eachLimited(items, limit, fn, signal) {
 }
 
 /** Every row of a paged list, walking nextCursor. */
-export async function walk(local, path, signal) {
+export async function walk(local, urlPath, signal) {
     const rows = [];
     let after = null;
-    const sep = path.includes('?') ? '&' : '?';
+    const sep = urlPath.includes('?') ? '&' : '?';
     do {
-        const page = await local.json(`${path}${sep}limit=${PAGE}&count=false${after ? `&after=${encodeURIComponent(after)}` : ''}`, { signal });
+        const page = await local.json(`${urlPath}${sep}limit=${PAGE}&count=false${after ? `&after=${encodeURIComponent(after)}` : ''}`, { signal });
         rows.push(...(page.items || []));
         after = page.nextCursor || null;
     } while (after);
@@ -35,19 +34,16 @@ export async function walk(local, path, signal) {
 
 const listOf = (body, key) => (Array.isArray(body) ? body : Array.isArray(body?.[key]) ? body[key] : []);
 
-/** A character's linked lorebook names, in order. */
 export async function characterWorlds(local, id, signal) {
     return listOf(await local.json(`/api/characters/${encodeURIComponent(id)}/worlds`, { signal }), 'worlds');
 }
 
-/** A stored chat row as it travels: a chat's own pictures do not, so their ids (meaningless elsewhere) are left out. */
 export function travellingRow(row) {
     if (!row?.extra?.attachments) return row;
     const { attachments, ...extra } = row.extra;
     return { ...row, extra };
 }
 
-/** Every stored row of a chat, oldest first. */
 export async function chatRows(local, id, signal) {
     const rows = [];
     const size = 500;
@@ -59,7 +55,6 @@ export async function chatRows(local, id, signal) {
     }
 }
 
-/** A playlist's member character ids in order, walking nextCursor. */
 export async function playlistMembers(local, id, signal) {
     const ids = [];
     let after = null;
@@ -71,9 +66,8 @@ export async function playlistMembers(local, id, signal) {
     return ids;
 }
 
-/** Normalized blocks of a preset for content hashing and transfer (strip row-specific block ids). */
 export const presetBlocksContent = (blocks) => (Array.isArray(blocks) ? blocks : []).map((b, i) => ({
-    key: b.key ?? null,
+    key: b.key ?? b.block_key ?? null,
     name: b.name ?? null,
     kind: b.kind === 'marker' ? 'marker' : 'text',
     marker: b.kind === 'marker' ? (b.marker ?? null) : null,
@@ -81,180 +75,289 @@ export const presetBlocksContent = (blocks) => (Array.isArray(blocks) ? blocks :
     role: b.role || 'system',
     position: b.position || 'pre_history',
     depth: Number.isInteger(b.depth) ? b.depth : 0,
-    injectionOrder: Number.isInteger(b.injectionOrder) ? b.injectionOrder : 100,
-    forbidOverrides: !!b.forbidOverrides,
-    enabled: b.enabled !== false,
+    injectionOrder: Number.isInteger(b.injectionOrder ?? b.injection_order) ? (b.injectionOrder ?? b.injection_order) : 100,
+    forbidOverrides: !!(b.forbidOverrides ?? b.forbid_overrides),
+    enabled: b.enabled !== false && b.enabled !== 0,
     pos: i,
 }));
 
-// a lorebook's content is its data ({entries, ...meta}); the rest of its answer is the shelf's bookkeeping
 export const worldContent = (doc) => doc?.data ?? {};
 
-const cardContent = (card) => {
-    const { tags, ...data } = card?.data || {};
-    return { spec: card?.spec, spec_version: card?.spec_version, data };
-};
+function fileAvatarHash(filePath, cacheMap, id) {
+    try {
+        const st = fs.statSync(filePath);
+        const key = `${st.size}:${st.mtimeMs}`;
+        if (cacheMap?.[id]?.etag === key && cacheMap[id].avatar) return { etag: key, avatar: cacheMap[id].avatar };
+        const avatar = sha256(fs.readFileSync(filePath));
+        return { etag: key, avatar };
+    } catch {
+        return { etag: '', avatar: '' };
+    }
+}
 
 /**
- * Scan this library.
- * @param {ReturnType<import('./http.js').localClient>} local
+ * Fast, direct SQLite + disk scan of a library.
+ * @param {import('better-sqlite3').Database} db
+ * @param {Record<string, string>} paths
  * @param {ReturnType<import('./store.js').makeStore>} store
- * @param {{datasets: string[], signal?: AbortSignal, onProgress?: (note: string) => void}} opts
+ * @param {{datasets?: string[]}} [opts]
  */
-export async function buildManifest(local, store, { datasets, signal, onProgress = () => {} }) {
+export function buildManifestFromDb(db, paths, store, { datasets = DATASETS } = {}) {
     const want = new Set(datasets);
     const cache = store.digestCache();
     const fresh = { chars: {}, chats: {}, personas: {} };
-    const manifest = { characters: [], chats: [], worlds: [], personas: [], presets: [], playlists: [] };
+    const manifest = {
+        characters: [],
+        chats: [],
+        worlds: [],
+        personas: [],
+        presets: [],
+        playlists: [],
+        backgrounds: [],
+        connections: [],
+    };
 
-    if (want.has('characters') || want.has('chats')) {
-        const rows = await walk(local, '/api/characters?sort=name', signal);
-        await eachLimited(rows, CONCURRENCY, async (row, i) => {
-            if (i % 50 === 0) onProgress(`Scanning characters (${i} of ${rows.length})`);
-            const id = row.id;
-            const enc = encodeURIComponent(id);
-            const [detail, head, worlds] = await Promise.all([
-                local.json(`/api/characters/${enc}`, { signal }),
-                local.request(`/avatars/${enc}.png`, { method: 'HEAD', signal, ok: false }),
-                characterWorlds(local, id, signal),
-            ]);
-            // an avatar's ETag is its size and time on disk: hash its bytes only when that moved
-            const etag = head.ok ? head.headers.get('etag') || '' : '';
-            let avatar = cache.chars[id]?.etag === etag && etag ? cache.chars[id].avatar : null;
-            if (avatar == null) {
-                const img = await local.request(`/avatars/${enc}.png`, { signal, ok: false });
-                avatar = img.ok ? sha256(Buffer.from(await img.arrayBuffer())) : '';
-            }
-            fresh.chars[id] = { etag, avatar };
+    if (want.has('characters') || want.has('chats') || want.has('playlists')) {
+        const chars = db.prepare('SELECT id, name, card, content_hash, fav, update_locked, media_localized, lore_dismissed, updated_at FROM characters ORDER BY name COLLATE NOCASE').all();
+        const tagRows = db.prepare('SELECT ct.char_id, t.name FROM char_tags ct JOIN tags t ON t.id = ct.tag_id ORDER BY ct.char_id, t.name COLLATE NOCASE').all();
+        const worldRows = db.prepare('SELECT char_id, world_name FROM char_worlds ORDER BY char_id, pos').all();
+        const mediaRows = db.prepare("SELECT char_id, COUNT(*) AS n, GROUP_CONCAT(COALESCE(content_hash, file || ':' || COALESCE(size, 0)), '|') AS sig FROM (SELECT char_id, content_hash, file, size FROM media ORDER BY char_id, display_name) GROUP BY char_id").all();
+
+        const tagsByChar = new Map();
+        for (const r of tagRows) {
+            if (!tagsByChar.has(r.char_id)) tagsByChar.set(r.char_id, []);
+            tagsByChar.get(r.char_id).push(r.name);
+        }
+        const worldsByChar = new Map();
+        for (const r of worldRows) {
+            if (!worldsByChar.has(r.char_id)) worldsByChar.set(r.char_id, []);
+            worldsByChar.get(r.char_id).push(r.world_name);
+        }
+        const mediaByChar = new Map(mediaRows.map(r => [r.char_id, { count: r.n, sig: r.sig || '' }]));
+
+        for (const c of chars) {
+            const av = paths?.avatarsDir
+                ? fileAvatarHash(path.join(paths.avatarsDir, `${c.id}.png`), cache.chars, c.id)
+                : { etag: '', avatar: '' };
+            fresh.chars[c.id] = av;
+            const m = mediaByChar.get(c.id) || { count: 0, sig: '' };
             manifest.characters.push({
-                id,
-                name: detail.card?.data?.name || row.name || '',
-                updatedAt: detail.updatedAt ?? row.updatedAt ?? 0,
-                mediaCount: detail.mediaCount ?? 0,
-                card: sha256(`${canon(cardContent(detail.card))}|${avatar}`),
+                id: c.id,
+                name: c.name || '',
+                updatedAt: c.updated_at ?? 0,
+                mediaCount: m.count,
+                mediaSig: sha256(m.sig),
+                card: sha256(`${c.content_hash || sha256(c.card)}|${av.avatar}`),
                 meta: sha256(canon({
-                    tags: [...(detail.tags || [])].sort(),
-                    fav: !!detail.fav,
-                    updateLocked: !!detail.updateLocked,
-                    worlds,
-                })),
-            });
-        }, signal);
-    }
-
-    if (want.has('chats')) {
-        const rows = (await walk(local, '/api/chats?sort=created', signal)).filter(r => r.charId);
-        await eachLimited(rows, CONCURRENCY, async (row, i) => {
-            if (i % 50 === 0) onProgress(`Scanning chats (${i} of ${rows.length})`);
-            const key = `${row.updatedAt}|${row.messageCount}`;
-            let digest = cache.chats[row.id]?.key === key ? cache.chats[row.id].rows : null;
-            if (digest == null) digest = sha256(canon((await chatRows(local, row.id, signal)).rows));
-            fresh.chats[row.id] = { key, rows: digest };
-            manifest.chats.push({
-                id: row.id,
-                charId: row.charId,
-                name: row.name,
-                updatedAt: row.updatedAt ?? 0,
-                messageCount: row.messageCount ?? 0,
-                // the draft (the composer's unsent text) never moves updatedAt, so it is read from the row each scan
-                digest: sha256(`${digest}|${canon(row.chatMetadata || {})}|${row.draft || ''}`),
-            });
-        }, signal);
-    }
-
-    if (want.has('lorebooks')) {
-        onProgress('Scanning lorebooks');
-        const rows = await walk(local, '/api/worlds?placeholders=false', signal);
-        await eachLimited(rows, CONCURRENCY, async (row) => {
-            const doc = await local.json(`/api/worlds/${encodeURIComponent(row.name)}`, { signal });
-            manifest.worlds.push({ name: row.name, digest: sha256(canon(worldContent(doc))) });
-        }, signal);
-    }
-
-    if (want.has('personas')) {
-        onProgress('Scanning personas');
-        const { personas = [] } = await local.json('/api/personas', { signal });
-        await eachLimited(personas, CONCURRENCY, async (p) => {
-            const id = p.id;
-            const enc = encodeURIComponent(id);
-            const head = await local.request(`/persona-avatars/${enc}.png`, { method: 'HEAD', signal, ok: false });
-            const etag = head.ok ? head.headers.get('etag') || '' : '';
-            let avatar = cache.personas?.[id]?.etag === etag && etag ? cache.personas[id].avatar : null;
-            if (avatar == null) {
-                if (!head.ok) avatar = '';
-                else {
-                    const img = await local.request(`/persona-avatars/${enc}.png`, { signal, ok: false });
-                    avatar = img.ok ? sha256(Buffer.from(await img.arrayBuffer())) : '';
-                }
-            }
-            fresh.personas[id] = { etag, avatar };
-            manifest.personas.push({
-                id,
-                name: p.name || '',
-                updatedAt: p.updatedAt ?? 0,
-                hasAvatar: !!avatar,
-                digest: sha256(canon({
-                    name: p.name || '',
-                    description: p.description || '',
-                    pronouns: p.pronouns || {},
-                    worlds: Array.isArray(p.worlds) ? p.worlds : [],
-                    avatar,
-                })),
-            });
-        }, signal);
-    }
-
-    if (want.has('presets')) {
-        onProgress('Scanning presets');
-        const { presets = [] } = await local.json('/api/presets', { signal });
-        for (const p of presets) {
-            manifest.presets.push({
-                id: p.id,
-                name: p.name || '',
-                updatedAt: p.updatedAt ?? 0,
-                digest: sha256(canon({
-                    name: p.name || '',
-                    blocks: presetBlocksContent(p.blocks),
+                    tags: tagsByChar.get(c.id) || [],
+                    fav: !!c.fav,
+                    updateLocked: !!c.update_locked,
+                    worlds: worldsByChar.get(c.id) || [],
                 })),
             });
         }
     }
 
-    if (want.has('playlists')) {
-        onProgress('Scanning playlists');
-        const doc = await local.json('/api/playlists', { signal });
-        const order = Array.isArray(doc?.order) ? doc.order : Object.keys(doc?.playlists || {});
-        await eachLimited(order, CONCURRENCY, async (id) => {
-            const p = doc.playlists?.[id];
-            if (!p) return;
-            const members = await playlistMembers(local, id, signal);
-            manifest.playlists.push({
-                id,
+    if (want.has('chats')) {
+        const chats = db.prepare('SELECT id, char_id, name, chat_metadata, draft, persona_id, preset_id, profile_id, message_count, updated_at FROM chats ORDER BY create_date, id').all();
+        const worldRows = db.prepare('SELECT chat_id, world_name FROM chat_worlds ORDER BY chat_id, pos').all();
+        const attRows = db.prepare("SELECT chat_id, COUNT(*) AS n, GROUP_CONCAT(content_hash, '|') AS sig FROM (SELECT chat_id, content_hash FROM attachments WHERE chat_id IS NOT NULL ORDER BY chat_id, id) GROUP BY chat_id").all();
+        const worldsByChat = new Map();
+        for (const r of worldRows) {
+            if (!worldsByChat.has(r.chat_id)) worldsByChat.set(r.chat_id, []);
+            worldsByChat.get(r.chat_id).push(r.world_name);
+        }
+        const attByChat = new Map(attRows.map(r => [r.chat_id, `${r.n}:${r.sig || ''}`]));
+        const msgStmt = db.prepare('SELECT data FROM chat_messages WHERE chat_id = ? ORDER BY seq');
+
+        for (const ch of chats) {
+            const attSig = attByChat.get(ch.id) || '';
+            const key = `${ch.updated_at}|${ch.message_count}|${attSig}`;
+            let rowsDigest = cache.chats?.[ch.id]?.key === key ? cache.chats[ch.id].rows : null;
+            if (rowsDigest == null) {
+                const rawList = msgStmt.all(ch.id).map(r => r.data);
+                rowsDigest = sha256(`${rawList.join('\n')}|${attSig}`);
+            }
+            fresh.chats[ch.id] = { key, rows: rowsDigest };
+            manifest.chats.push({
+                id: ch.id,
+                charId: ch.char_id,
+                name: ch.name,
+                updatedAt: ch.updated_at ?? 0,
+                messageCount: ch.message_count ?? 0,
+                digest: sha256(`${rowsDigest}|${ch.chat_metadata || '{}'}|${ch.draft || ''}|${ch.persona_id || ''}|${ch.preset_id || ''}|${(worldsByChat.get(ch.id) || []).join(',')}`),
+            });
+        }
+    }
+
+    if (want.has('lorebooks')) {
+        const worlds = db.prepare('SELECT name, data, updated_at, placeholder FROM worlds WHERE placeholder = 0 ORDER BY name COLLATE NOCASE').all();
+        const entryStmt = db.prepare('SELECT uid, data FROM world_entries WHERE world_name = ? ORDER BY uid');
+        for (const w of worlds) {
+            const entries = entryStmt.all(w.name);
+            manifest.worlds.push({
+                name: w.name,
+                updatedAt: w.updated_at ?? 0,
+                digest: sha256(`${w.data}|${entries.map(e => `${e.uid}:${e.data}`).join('\n')}`),
+            });
+        }
+    }
+
+    if (want.has('personas')) {
+        const personas = db.prepare('SELECT * FROM personas ORDER BY name COLLATE NOCASE').all();
+        const worldRows = db.prepare('SELECT persona_id, world_name FROM persona_worlds ORDER BY persona_id, pos').all();
+        const worldsByPersona = new Map();
+        for (const r of worldRows) {
+            if (!worldsByPersona.has(r.persona_id)) worldsByPersona.set(r.persona_id, []);
+            worldsByPersona.get(r.persona_id).push(r.world_name);
+        }
+        for (const p of personas) {
+            const av = paths?.personaAvatarsDir && p.avatar
+                ? fileAvatarHash(path.join(paths.personaAvatarsDir, `${p.id}.png`), cache.personas, p.id)
+                : { etag: '', avatar: '' };
+            fresh.personas[p.id] = av;
+            manifest.personas.push({
+                id: p.id,
                 name: p.name || '',
-                updatedAt: p.modified ?? p.created ?? 0,
-                members,
-                meta: sha256(canon({
-                    name: p.name || '',
-                    description: p.description || '',
-                    icon: p.icon || '',
-                    color: p.color || '',
-                })),
+                updatedAt: p.updated_at ?? 0,
+                hasAvatar: !!av.avatar,
                 digest: sha256(canon({
                     name: p.name || '',
                     description: p.description || '',
-                    icon: p.icon || '',
-                    color: p.color || '',
-                    members,
+                    pronouns: {
+                        sub: p.pronoun_sub ?? '',
+                        obj: p.pronoun_obj ?? '',
+                        poss: p.pronoun_poss ?? '',
+                        possP: p.pronoun_poss_p ?? '',
+                        ref: p.pronoun_ref ?? '',
+                    },
+                    worlds: worldsByPersona.get(p.id) || [],
+                    avatar: av.avatar,
                 })),
             });
-        }, signal);
+        }
     }
 
-    // keep what this scan read alongside what it did not (a dataset left out this time)
+    if (want.has('presets')) {
+        const presets = db.prepare('SELECT * FROM presets ORDER BY name COLLATE NOCASE').all();
+        const blockStmt = db.prepare('SELECT * FROM preset_blocks WHERE preset_id = ? ORDER BY pos');
+        for (const p of presets) {
+            const blocks = presetBlocksContent(blockStmt.all(p.id));
+            manifest.presets.push({
+                id: p.id,
+                name: p.name || '',
+                updatedAt: p.updated_at ?? 0,
+                digest: sha256(canon({ name: p.name || '', blocks })),
+            });
+        }
+    }
+
+    if (want.has('playlists')) {
+        const lists = db.prepare('SELECT * FROM playlists ORDER BY pos, created_at').all();
+        const memStmt = db.prepare('SELECT char_id FROM playlist_chars WHERE playlist_id = ? ORDER BY pos');
+        for (const p of lists) {
+            const members = memStmt.all(p.id).map(r => r.char_id);
+            manifest.playlists.push({
+                id: p.id,
+                name: p.name || '',
+                updatedAt: p.modified_at ?? p.created_at ?? 0,
+                members,
+                meta: sha256(canon({ name: p.name || '', description: p.description || '', icon: p.icon || '', color: p.color || '' })),
+                digest: sha256(canon({ name: p.name || '', description: p.description || '', icon: p.icon || '', color: p.color || '', members })),
+            });
+        }
+    }
+
+    if (want.has('backgrounds')) {
+        const bgs = db.prepare('SELECT * FROM backgrounds ORDER BY id').all();
+        for (const b of bgs) {
+            manifest.backgrounds.push({
+                id: b.id,
+                file: b.file,
+                name: b.display_name,
+                contentHash: b.content_hash || `${b.file}:${b.size}`,
+                updatedAt: b.added_at ?? 0,
+                digest: sha256(canon({ displayName: b.display_name, contentHash: b.content_hash, size: b.size })),
+            });
+        }
+    }
+
+    if (want.has('connections')) {
+        const profs = db.prepare('SELECT * FROM llm_profiles ORDER BY pos, created_at').all();
+        for (const p of profs) {
+            manifest.connections.push({
+                id: p.id,
+                name: p.name || '',
+                updatedAt: p.updated_at ?? p.created_at ?? 0,
+                digest: sha256(canon({
+                    name: p.name,
+                    kind: p.kind,
+                    baseUrl: p.base_url,
+                    apiKey: p.api_key,
+                    model: p.model,
+                    params: p.params,
+                    contextSize: p.context_size,
+                    vision: p.vision,
+                    maxImages: p.max_images,
+                })),
+            });
+        }
+    }
+
     store.saveDigestCache({
         chars: want.has('characters') || want.has('chats') ? fresh.chars : cache.chars,
         chats: want.has('chats') ? fresh.chats : cache.chats,
         personas: want.has('personas') ? fresh.personas : (cache.personas || {}),
     });
     return manifest;
+}
+
+/**
+ * Build a manifest of all physical media files on disk for fast delta file transfer.
+ */
+export function buildFileManifest(db, paths, { datasets = DATASETS } = {}) {
+    const want = new Set(datasets);
+    const files = [];
+
+    const pushIf = (kind, relPath, fullPath, sizeHint = null) => {
+        try {
+            const st = fs.statSync(fullPath);
+            if (st.isFile()) files.push({ kind, relPath: relPath.replace(/\\/g, '/'), size: st.size });
+        } catch {
+            if (sizeHint != null) files.push({ kind, relPath: relPath.replace(/\\/g, '/'), size: sizeHint });
+        }
+    };
+
+    if (want.has('characters')) {
+        for (const r of db.prepare('SELECT id FROM characters').iterate()) {
+            pushIf('avatars', `${r.id}.png`, path.join(paths.avatarsDir, `${r.id}.png`));
+        }
+        for (const m of db.prepare('SELECT char_id, file, size FROM media').iterate()) {
+            pushIf('gallery', `${m.char_id}/${m.file}`, path.join(paths.galleryRoot, m.char_id, m.file), m.size);
+        }
+    }
+    if (want.has('personas')) {
+        for (const p of db.prepare('SELECT id FROM personas WHERE avatar IS NOT NULL').iterate()) {
+            pushIf('personas', `${p.id}.png`, path.join(paths.personaAvatarsDir, `${p.id}.png`));
+        }
+    }
+    if (want.has('chats')) {
+        for (const a of db.prepare('SELECT chat_id, studio_id, file, size FROM attachments').iterate()) {
+            const owner = a.chat_id ?? a.studio_id;
+            if (owner) pushIf('attachments', `${owner}/${a.file}`, path.join(paths.attachmentsRoot, owner, a.file), a.size);
+        }
+    }
+    if (want.has('backgrounds')) {
+        for (const b of db.prepare('SELECT file, size FROM backgrounds').iterate()) {
+            pushIf('backgrounds', b.file, path.join(paths.backgroundsDir, b.file), b.size);
+        }
+    }
+    return files;
+}
+
+export async function buildManifest(localOrDb, store, opts = {}) {
+    if (localOrDb && typeof localOrDb.prepare === 'function') {
+        return buildManifestFromDb(localOrDb, opts.paths || {}, store, opts);
+    }
+    return { characters: [], chats: [], worlds: [], personas: [], presets: [], playlists: [], backgrounds: [], connections: [] };
 }

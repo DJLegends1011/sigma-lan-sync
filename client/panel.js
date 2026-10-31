@@ -23,6 +23,12 @@ const COUNT_WORDS = [
     ['playlistsNew', 'new playlist', 'new playlists'],
     ['playlistsChanged', 'changed playlist', 'changed playlists'],
     ['playlistsDeleted', 'playlist to remove', 'playlists to remove'],
+    ['backgroundsNew', 'new background', 'new backgrounds'],
+    ['backgroundsChanged', 'changed background', 'changed backgrounds'],
+    ['backgroundsDeleted', 'background to remove', 'backgrounds to remove'],
+    ['connectionsNew', 'new connection', 'new connections'],
+    ['connectionsChanged', 'changed connection', 'changed connections'],
+    ['connectionsDeleted', 'connection to remove', 'connections to remove'],
 ];
 
 export function describeCounts(counts) {
@@ -285,19 +291,22 @@ export function createPanel(ctx) {
         const el = region('options');
         if (!el) return;
         const on = (k) => (ctx.settings.get(k) !== false ? ' checked' : '');
+        const onExplicit = (k) => (ctx.settings.get(k) === true ? ' checked' : '');
         const sel = (k, v) => (ctx.settings.get(k) === v ? ' selected' : '');
-        const toggle = (key, text) => `
+        const toggle = (key, text, explicit = false) => `
             <div class="settings-row">
-                <label><input type="checkbox" class="cl-switch-input" data-ls-set="${key}"${on(key)}><span class="cl-switch" aria-hidden="true"></span><span>${text}</span></label>
+                <label><input type="checkbox" class="cl-switch-input" data-ls-set="${key}"${explicit ? onExplicit(key) : on(key)}><span class="cl-switch" aria-hidden="true"></span><span>${text}</span></label>
             </div>`;
         el.innerHTML = `
             <div class="ls-checks">
                 ${toggle('syncCharacters', 'Characters (cards, pictures, tags, galleries)')}
-                ${toggle('syncChats', 'Chats (messages, notes and unsent drafts)')}
-                ${toggle('syncLorebooks', 'Lorebooks')}
+                ${toggle('syncChats', 'Chats (messages, attachments, notes and unsent drafts)')}
+                ${toggle('syncLorebooks', 'Lorebooks (worlds and global bindings)')}
                 ${toggle('syncPersonas', 'Personas (names, descriptions, pronouns, pictures, lorebooks)')}
                 ${toggle('syncPresets', 'Prompt presets (blocks and ordering)')}
                 ${toggle('syncPlaylists', 'Playlists (folders and character memberships)')}
+                ${toggle('syncBackgrounds', 'Backgrounds (chat wallpapers and bindings)')}
+                ${toggle('syncConnections', 'Connections (LLM profiles and API keys — opt-in)', true)}
             </div>
             <div class="settings-row">
                 <label for="ls-mode">Sync mode</label>
@@ -520,7 +529,7 @@ export function createPanel(ctx) {
                     <section class="ls-section">
                         <h3 class="ls-heading">What a Sync Carries</h3>
                         <div data-ls-region="options"></div>
-                        <p class="ls-muted">Each device's connections and settings stay its own. A chat's own pictures do not travel yet.</p>
+                        <p class="ls-muted">Synced directly via SQLite database snapshot + media files. Connections stay local unless toggled on.</p>
                     </section>
                 </div>`;
             body.addEventListener('click', (ev) => {

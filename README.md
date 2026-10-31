@@ -20,15 +20,15 @@ both devices. Each device needs to listen on the network: `host: 0.0.0.0` in `da
 
 What a sync carries, and how, is set in the panel:
 
-- **Characters** (card, picture, tags, favourite, linked lorebooks and new gallery items), **Chats** (messages,
-  Author's Note and other chat settings, and the unsent draft), **Lorebooks**, **Personas** (names, descriptions,
-  pronouns, pictures and bound lorebooks), **Prompt presets** (blocks and ordering), and **Playlists** (folders and
-  character memberships).
+- **Characters** (card, picture, tags, favourite, linked lorebooks, provider links and gallery items), **Chats**
+  (messages, chat attachments/pictures, characterless chats, Author's Note and other chat settings, and the unsent
+  draft), **Lorebooks** (worlds and global lorebook bindings), **Personas** (names, descriptions, pronouns, pictures,
+  bound lorebooks and active persona), **Prompt presets** (blocks, ordering and active preset), **Playlists** (folders
+  and character memberships), **Backgrounds** (chat wallpapers and bindings), and optionally **Connections** (LLM
+  profiles and API keys — off by default).
 - **Incremental** brings in what is new or changed. **Mirror** also removes what the other device does not have.
 - **Exact** lets the device you sync from win. **Prefer newer** keeps this device's edit when its own clock says it
   is newer.
-
-Each device's connections and settings stay its own.
 
 ## How it works
 
@@ -37,19 +37,18 @@ Each device's connections and settings stay its own.
   six digits both screens show come from both keys, so a device standing in between would show different digits.
 - Every later request between the two is signed with that secret (HMAC-SHA256 over method, path, time and body). A
   paired device can only read; "push" asks the other side to pull.
-- A sync compares content digests (card plus picture, tags and flags, chat messages, lorebook entries), not
-  timestamps, so a synced item reads as unchanged on the next pass. Characters keep their ids across devices; a card
-  imported on both devices apart is recognised as the same character.
-- New characters travel as Σ's own transfer bundles; changes go through Σ's public API (replace, PATCH, the chat
-  message routes), so every write is guarded and shows up live in every open tab.
+- Direct SQLite Database + Media Sync: instead of crawling hundreds of HTTP endpoints, the source device creates an
+  atomic SQLite snapshot (`VACUUM INTO`) and strips local-only state (`change_log`, `x_lan_sync_*`, and `llm_profiles`
+  unless Connections sync is enabled). The receiving device attaches the snapshot (`ATTACH DATABASE ... AS remote`) and
+  merges all selected tables inside a single native SQLite transaction while SQLite triggers maintain FTS5 search
+  indexes and counters automatically, then streams any new or changed media files (`avatars`, `gallery`, `personas`,
+  `attachments`, `backgrounds`).
 
 ## Limits
 
 - Needs a server without accounts (single user).
 - Traffic between the two devices is plain HTTP, like Σ itself on your network. Requests are signed, but their
   content is not encrypted: sync on networks you trust, or over a VPN such as Tailscale.
-- A chat's own pictures (attachments) do not travel yet; gallery sync only adds, never removes.
-- Renaming a chat makes it a new chat to the other device.
 
 ## Tests
 
