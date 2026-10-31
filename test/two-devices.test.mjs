@@ -363,3 +363,52 @@ test('mirror removes on the phone what the desktop no longer holds', async () =>
     assert.equal((await phone.api(`/characters/${ids.iris}`)).status, 404);
     assert.equal((await phone.api(`/characters/${ids.nova}`)).status, 200);
 });
+
+test('direct QR-less pairing, peer renaming, and auto-sync configuration work without a camera', async () => {
+    // Unpair first, then re-pair via /pairing/direct using only the desktop's host:port
+    const unpPhone = await phone.ext(`/peers/${deskId}`, 'DELETE');
+    assert.equal(unpPhone.status, 200);
+    const unpDesk = await desk.ext(`/peers/${phoneId}`, 'DELETE');
+    assert.equal(unpDesk.status, 200);
+
+    const deskHostPort = desk.base.replace(/^http:\/\//, '');
+    const resp = await fetch(`${phone.base}/api/ext/lan-sync/pairing/direct`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ address: deskHostPort }),
+    });
+    assert.equal(resp.status, 200);
+
+    let phoneCode = null;
+    let paired = null;
+    for await (const line of ndjson(resp)) {
+        assert.ok(!line.error, line.error);
+        if (line.step === 'confirm') {
+            phoneCode = line.code;
+            const { body } = await desk.ext('/pairing/requests');
+            assert.equal(body.requests.length, 1);
+            assert.equal(body.requests[0].code, phoneCode);
+            const allowed = await desk.ext(`/pairing/requests/${body.requests[0].id}`, 'POST', { allow: true });
+            assert.equal(allowed.body.status, 'approved');
+        }
+        if (line.step === 'paired') paired = line;
+    }
+    assert.ok(phoneCode && paired, 'direct pairing completed without a QR code');
+
+    // Rename the desktop locally on the phone
+    const renamed = await phone.ext(`/peers/${deskId}`, 'PATCH', { customName: 'Main Desktop' });
+    assert.equal(renamed.status, 200);
+    assert.equal(renamed.body.customName, 'Main Desktop');
+
+    // Configure Auto Sync on the phone
+    const autoRes = await phone.ext('/automation', 'PATCH', {
+        enabled: true,
+        intervalMinutes: 15,
+        targetId: deskId,
+    });
+    assert.equal(autoRes.status, 200);
+    assert.equal(autoRes.body.config.enabled, true);
+    assert.equal(autoRes.body.config.intervalMinutes, 15);
+    assert.equal(autoRes.body.config.targetId, deskId);
+    assert.ok(autoRes.body.status.nextRunAtMs > Date.now());
+});

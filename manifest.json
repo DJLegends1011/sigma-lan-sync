@@ -1,9 +1,9 @@
 {
     "id": "lan-sync",
     "name": "LAN Sync",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "author": "DJLegends",
-    "description": "Keeps two Project Σ installs in step over your network via direct SQLite database + media sync: pair a phone and a desktop by scanning a QR code, then pull or push characters, chats (with attachments), lorebooks, personas, presets, playlists, backgrounds and connections between them.",
+    "description": "Keeps two Project Σ installs in step over your network via automatic LAN discovery, manual IP, or QR code, with direct SQLite database + media sync and scheduled Auto Sync.",
     "requires": { "api": "2.5" },
     "settings": {
         "deviceName": "",

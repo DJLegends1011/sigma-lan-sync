@@ -1,6 +1,6 @@
 // LAN Sync, the server half. Three groups of routes under /api/ext/lan-sync:
-//   the page's own (status, pairing, paired devices, pull and push),
-//   pairing (/peer/pair/*: unsigned, answering only to a live pairing code),
+//   the page's own (status, nearby discovery, pairing, paired devices, automation, pull and push),
+//   pairing (/peer/pair/*: unsigned, answering either to a live QR code or a direct LAN/manual pairing request),
 //   peer (/peer/*: signed with a paired device's secret, read-only views of this library).
 // A paired device can read this library and ask it to pull; nothing a peer sends writes here directly.
 import fs from 'node:fs';
@@ -8,6 +8,7 @@ import { Readable } from 'node:stream';
 import { parsePairLink, buildPairLink } from '../client/pair-link.js';
 import { randomId, keyPair, deriveSecret, shortCode, hmac, safeEqual, verifySignature } from './crypto.js';
 import { makeStore, deviceName } from './store.js';
+import { createLanDiscovery, detectPlatform } from './discovery.js';
 import { localBase, localClient, peerClient, pairingCall, firstReachable, listenInfo, reachableAddresses, remoteIp } from './http.js';
 import { buildManifestFromDb, buildFileManifest, walk, chatRows, characterWorlds, playlistMembers, DATASETS } from './manifest.js';
 import { runPull, createDbSnapshot, resolveMediaFile } from './sync.js';
@@ -16,18 +17,75 @@ const PAIRING_TTL_MS = 10 * 60 * 1000;
 const MAX_PENDING = 5;
 const enc = encodeURIComponent;
 
+function normalizeManualAddress(raw) {
+    let s = String(raw || '').trim().replace(/\/+$/, '');
+    s = s.replace(/^https?:\/\//i, '');
+    if (!s) return null;
+    if (!/:\d{1,5}$/.test(s)) s = `${s}:7788`;
+    if (!/^[^\s/]+:\d{1,5}$/.test(s)) return null;
+    return s;
+}
+
 export function register(router, ctx) {
     // a pairing offer per account: its code, its key pair and the requests it has heard
     const offers = new Map();
+    // direct (QR-less) pairing requests per account: from nearby discovery or manual IP
+    const directRequests = new Map(); // handle -> Map<requestId, request>
+    // persistent X25519 keypair per account for QR-less nearby / manual pairing
+    const directKeysByHandle = new Map();
+    // UDP multicast/broadcast LAN discovery
+    const discovery = createLanDiscovery();
+    // background auto-sync state per account
+    const autoStates = new Map();
+
+    const getDirectKeys = (handle) => {
+        let keys = directKeysByHandle.get(handle);
+        if (!keys) {
+            keys = keyPair();
+            directKeysByHandle.set(handle, keys);
+        }
+        return keys;
+    };
+
+    const getDirectRequestMap = (handle) => {
+        let map = directRequests.get(handle);
+        if (!map) {
+            map = new Map();
+            directRequests.set(handle, map);
+        }
+        const now = Date.now();
+        for (const [id, r] of map) {
+            if (r.expiresAt + 2 * 60 * 1000 < now) map.delete(id);
+        }
+        return map;
+    };
 
     const parts = (req) => {
         const store = makeStore(ctx.files.user(req));
+        const me = store.identity();
+        const name = deviceName(ctx.setting(req.db, 'deviceName'));
+        const port = req.socket.localPort;
+        const listen = listenInfo(req);
+        const handle = req.userHandle || 'default';
+        const dKeys = getDirectKeys(handle);
+        discovery.announce({
+            id: me.deviceId,
+            name,
+            platform: me.platform || detectPlatform(),
+            port,
+            loopbackOnly: listen.loopbackOnly,
+            publicKey: dKeys.publicKey,
+        });
         return {
             store,
-            me: store.identity(),
-            name: deviceName(ctx.setting(req.db, 'deviceName')),
+            me,
+            name,
+            platform: me.platform || detectPlatform(),
             local: localClient(localBase(req)),
-            port: req.socket.localPort,
+            port,
+            listen,
+            handle,
+            directKeys: dKeys,
         };
     };
 
@@ -56,29 +114,189 @@ export function register(router, ctx) {
         return offer || null;
     };
 
-    // ── this device ─────────────────────────────────────────
+    const collectPendingRequests = (handle) => {
+        const offer = liveOffer(handle);
+        const fromOffer = offer ? [...offer.requests.values()].filter(r => r.status === 'pending') : [];
+        const dMap = getDirectRequestMap(handle);
+        const fromDirect = [...dMap.values()].filter(r => r.status === 'pending' && r.expiresAt > Date.now());
+        return [...fromOffer, ...fromDirect].map(r => ({
+            id: r.id,
+            name: r.device.name,
+            platform: r.device.platform || 'device',
+            address: r.ip,
+            code: r.sas,
+        }));
+    };
+
+    // ── background auto-sync scheduler (TauriTavern SyncAutomationService style) ──
+
+    const ensureAutomationTimer = (req) => {
+        const { store, me, port, handle } = parts(req);
+        const db = req.db;
+        let st = autoStates.get(handle);
+        if (!st) {
+            st = {
+                timer: null,
+                running: false,
+                nextRunAtMs: null,
+                lastAttemptAtMs: null,
+                lastAcceptedAtMs: null,
+                lastErrorAtMs: null,
+                lastError: '',
+            };
+            autoStates.set(handle, st);
+        }
+        const cfg = store.automation();
+        if (!cfg.enabled || !cfg.targetId) {
+            if (st.timer) {
+                clearInterval(st.timer);
+                st.timer = null;
+            }
+            st.nextRunAtMs = null;
+            return st;
+        }
+        const intervalMs = cfg.intervalMinutes * 60 * 1000;
+        if (!st.timer || st.intervalMs !== intervalMs) {
+            if (st.timer) clearInterval(st.timer);
+            st.intervalMs = intervalMs;
+            st.nextRunAtMs = Date.now() + intervalMs;
+            st.timer = setInterval(async () => {
+                const latestCfg = store.automation();
+                if (!latestCfg.enabled || !latestCfg.targetId || st.running) return;
+                const record = store.peer(latestCfg.targetId);
+                if (!record) {
+                    st.lastError = 'Selected auto-sync target device is no longer paired';
+                    st.lastErrorAtMs = Date.now();
+                    return;
+                }
+                const discovered = discovery.snapshot().find(d => d.id === record.id);
+                const targetAddress = discovered?.addresses?.[0] || record.address;
+                st.running = true;
+                st.lastAttemptAtMs = Date.now();
+                try {
+                    const { mode: _m, ...options } = syncOptions(db);
+                    const peer = peerClient({ address: targetAddress, deviceId: me.deviceId, secret: record.secret });
+                    await peer.json('/peer/pull-request', { method: 'POST', json: { port, options }, timeout: 10_000 });
+                    store.updatePeer(record.id, { address: targetAddress, lastPushRequestAt: Date.now() });
+                    st.lastAcceptedAtMs = Date.now();
+                    st.lastError = '';
+                    st.lastErrorAtMs = null;
+                } catch (e) {
+                    st.lastError = e.message || String(e);
+                    st.lastErrorAtMs = Date.now();
+                } finally {
+                    st.running = false;
+                    st.nextRunAtMs = Date.now() + latestCfg.intervalMinutes * 60 * 1000;
+                }
+            }, intervalMs);
+            st.timer.unref?.();
+        }
+        return st;
+    };
+
+    // ── this device & discovery ─────────────────────────────
 
     router.get('/status', (req, res) => {
-        const { store, me, name, port } = parts(req);
-        const offer = liveOffer(req.userHandle);
+        const { store, me, name, platform, port, handle } = parts(req);
+        const offer = liveOffer(handle);
         const listen = listenInfo(req);
+        const autoState = ensureAutomationTimer(req);
+        const discovered = discovery.snapshot().filter(d => d.id !== me.deviceId);
+        const discoveredById = new Map(discovered.map(d => [d.id, d]));
+
+        const peers = store.peers().map((p) => {
+            const live = discoveredById.get(p.id);
+            let address = p.address;
+            let peerPlatform = p.platform || 'device';
+            if (live) {
+                if (live.addresses?.[0] && live.addresses[0] !== p.address) {
+                    address = live.addresses[0];
+                    store.updatePeer(p.id, { address, name: live.name || p.name, platform: live.platform || p.platform });
+                } else if (live.platform && live.platform !== p.platform) {
+                    peerPlatform = live.platform;
+                    store.updatePeer(p.id, { platform: peerPlatform });
+                }
+            }
+            const { secret, aliases, ...rest } = p;
+            return {
+                ...rest,
+                address,
+                platform: peerPlatform,
+                online: Boolean(live),
+            };
+        });
+
+        const pairedIds = new Set(peers.map(p => p.id));
+        const nearby = discovered
+            .filter(d => !pairedIds.has(d.id))
+            .map(d => ({
+                id: d.id,
+                name: d.name,
+                platform: d.platform || 'device',
+                address: d.addresses?.[0] || '',
+                addresses: d.addresses || [],
+            }));
+
         res.json({
-            device: { id: me.deviceId, name },
+            device: { id: me.deviceId, name, platform },
             port,
             loopbackOnly: listen.loopbackOnly,
             addresses: listen.loopbackOnly
                 ? [{ address: `127.0.0.1:${port}`, ip: '127.0.0.1', iface: 'loopback', kind: 'loopback' }]
                 : reachableAddresses(port),
             pairing: offer && !offer.closed && offer.expiresAt > Date.now() ? { expiresAt: offer.expiresAt } : null,
-            peers: store.peers().map(({ secret, aliases, ...p }) => p),
+            requests: collectPendingRequests(handle),
+            peers,
+            nearby,
+            automation: {
+                config: store.automation(),
+                status: {
+                    running: autoState.running,
+                    nextRunAtMs: autoState.nextRunAtMs,
+                    lastAttemptAtMs: autoState.lastAttemptAtMs,
+                    lastAcceptedAtMs: autoState.lastAcceptedAtMs,
+                    lastErrorAtMs: autoState.lastErrorAtMs,
+                    lastError: autoState.lastError,
+                },
+            },
             jobs: ctx.jobs.list(req.db),
         });
     });
 
-    // ── pairing: the device that shows the QR code ──────────
+    router.post('/discovery/refresh', (req, res) => {
+        const { me } = parts(req);
+        discovery.query();
+        const discovered = discovery.snapshot().filter(d => d.id !== me.deviceId);
+        res.json({ nearby: discovered });
+    });
+
+    router.patch('/automation', (req, res) => {
+        const { store } = parts(req);
+        const body = req.body || {};
+        const patch = {};
+        if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+        if (body.intervalMinutes !== undefined) patch.intervalMinutes = Number(body.intervalMinutes);
+        if (typeof body.targetId === 'string') patch.targetId = body.targetId.trim();
+        if (body.mode === 'mirror' || body.mode === 'incremental') patch.mode = body.mode;
+        const config = store.saveAutomation(patch);
+        const st = ensureAutomationTimer(req);
+        res.json({
+            config,
+            status: {
+                running: st.running,
+                nextRunAtMs: st.nextRunAtMs,
+                lastAttemptAtMs: st.lastAttemptAtMs,
+                lastAcceptedAtMs: st.lastAcceptedAtMs,
+                lastErrorAtMs: st.lastErrorAtMs,
+                lastError: st.lastError,
+            },
+        });
+    });
+
+    // ── pairing: the device that shows the QR code or receives a direct LAN request ──
 
     router.post('/pairing/start', (req, res) => {
-        const { me, name, port } = parts(req);
+        const { me, name, port, handle } = parts(req);
         // a server bound to loopback can still pair with another Σ on this same machine
         const loopbackOnly = listenInfo(req).loopbackOnly;
         // virtual adapters ride the code only when nothing better exists; three addresses keep the code small
@@ -91,60 +309,123 @@ export function register(router, ctx) {
             : null;
         const keys = keyPair();
         const offer = { code: randomId(12), expiresAt: Date.now() + PAIRING_TTL_MS, keys, requests: new Map(), closed: false };
-        offers.set(req.userHandle, offer);
+        offers.set(handle, offer);
         const link = buildPairLink({ id: me.deviceId, name, addresses, code: offer.code, expiresAt: offer.expiresAt, key: keys.publicKey }, port);
         res.json({ link, expiresAt: offer.expiresAt, addresses, warning });
     });
 
     router.post('/pairing/stop', (req, res) => {
-        offers.delete(req.userHandle);
+        const { handle } = parts(req);
+        offers.delete(handle);
         res.json({ ok: true });
     });
 
     router.get('/pairing/requests', (req, res) => {
-        const offer = liveOffer(req.userHandle);
-        const pending = offer ? [...offer.requests.values()].filter(r => r.status === 'pending') : [];
-        res.json({ requests: pending.map(r => ({ id: r.id, name: r.device.name, address: r.ip, code: r.sas })) });
+        const { handle } = parts(req);
+        res.json({ requests: collectPendingRequests(handle) });
     });
 
     router.post('/pairing/requests/:rid', (req, res) => {
-        const { store, me } = parts(req);
-        const offer = liveOffer(req.userHandle);
-        const request = offer?.requests.get(req.params.rid);
+        const { store, me, handle } = parts(req);
+        const offer = liveOffer(handle);
+        const dMap = getDirectRequestMap(handle);
+        const fromOffer = offer?.requests.get(req.params.rid);
+        const fromDirect = dMap.get(req.params.rid);
+        const request = fromOffer || fromDirect;
         if (!request || request.status !== 'pending') return res.status(404).json({ error: 'That pairing request is gone' });
         if (req.body?.allow !== true) {
             request.status = 'denied';
             return res.json({ ok: true, status: 'denied' });
         }
-        const secret = deriveSecret(offer.keys.privateKey, request.key, { code: offer.code, offerId: me.deviceId, joinId: request.device.id });
-        store.savePeer({ id: request.device.id, name: request.device.name, address: `${request.ip}:${request.port}`, secret, pairedAt: Date.now() });
+        const privateKey = fromOffer ? offer.keys.privateKey : request.offerKeys.privateKey;
+        const code = fromOffer ? offer.code : request.code;
+        const secret = deriveSecret(privateKey, request.key, { code, offerId: me.deviceId, joinId: request.device.id });
+        store.savePeer({
+            id: request.device.id,
+            name: request.device.name,
+            platform: request.device.platform || 'device',
+            address: `${request.ip}:${request.port}`,
+            secret,
+            pairedAt: Date.now(),
+        });
         request.status = 'approved';
         request.proof = hmac(secret, `paired|${request.id}`);
-        // one device a code: once approved, the offer answers only the device it approved
-        offer.closed = true;
+        if (fromOffer) {
+            // one device a code: once approved, the offer answers only the device it approved
+            offer.closed = true;
+        }
         res.json({ ok: true, status: 'approved' });
     });
 
-    // ── pairing: the routes the scanning device calls (no signature yet: the code is the key) ──
+    // ── pairing: the routes the joining device calls (QR code or direct LAN / manual IP) ──
+
+    router.get('/peer/pair/info', (req, res) => {
+        const { me, name, platform, port, directKeys } = parts(req);
+        res.json({
+            id: me.deviceId,
+            name,
+            platform,
+            port,
+            key: directKeys.publicKey,
+        });
+    });
 
     router.post('/peer/pair/request', (req, res) => {
-        const { me } = parts(req);
-        const offer = liveOffer(req.userHandle);
-        const { code, device, key, port } = req.body || {};
+        const { me, handle, directKeys } = parts(req);
+        const { code, direct, device, key, port } = req.body || {};
+        if (typeof device?.id !== 'string' || !device.id || typeof key !== 'string') {
+            return res.status(400).json({ error: 'A pairing request names its device and its key' });
+        }
+        if (device.id === me.deviceId) return res.status(400).json({ error: 'A device cannot pair with itself' });
+        const portNum = Number(port);
+        if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+            return res.status(400).json({ error: 'A pairing request names its port' });
+        }
+
+        // Direct QR-less pairing (from nearby discovery or manual IP connection)
+        if (direct === true) {
+            const dMap = getDirectRequestMap(handle);
+            const pendingCount = [...dMap.values()].filter(r => r.status === 'pending').length;
+            if (pendingCount >= MAX_PENDING) {
+                return res.status(429).json({ error: 'Too many pairing requests are waiting' });
+            }
+            const id = randomId(9);
+            const directCode = String(code || randomId(12));
+            dMap.set(id, {
+                id,
+                code: directCode,
+                offerKeys: directKeys,
+                device: {
+                    id: device.id,
+                    name: String(device.name || 'A device').slice(0, 60),
+                    platform: String(device.platform || 'device').slice(0, 20),
+                },
+                key,
+                ip: remoteIp(req),
+                port: portNum,
+                sas: shortCode(directKeys.publicKey, key, directCode),
+                expiresAt: Date.now() + PAIRING_TTL_MS,
+                status: 'pending',
+            });
+            return res.json({ requestId: id, code: directCode, key: directKeys.publicKey });
+        }
+
+        // QR / pairing link offer
+        const offer = liveOffer(handle);
         if (!offer || offer.closed) return res.status(409).json({ error: 'Pairing is not open on that device' });
         if (offer.expiresAt < Date.now()) return res.status(410).json({ error: 'That pairing code has expired' });
         if (!safeEqual(code, offer.code)) return res.status(403).json({ error: 'Invalid pairing code' });
-        if (typeof device?.id !== 'string' || !device.id || typeof key !== 'string') return res.status(400).json({ error: 'A pairing request names its device and its key' });
-        if (device.id === me.deviceId) return res.status(400).json({ error: 'A device cannot pair with itself' });
-        const portNum = Number(port);
-        if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return res.status(400).json({ error: 'A pairing request names its port' });
         if ([...offer.requests.values()].filter(r => r.status === 'pending').length >= MAX_PENDING) {
             return res.status(429).json({ error: 'Too many pairing requests are waiting' });
         }
         const id = randomId(9);
         offer.requests.set(id, {
             id,
-            device: { id: device.id, name: String(device.name || 'A device').slice(0, 60) },
+            device: {
+                id: device.id,
+                name: String(device.name || 'A device').slice(0, 60),
+                platform: String(device.platform || 'device').slice(0, 20),
+            },
             key,
             ip: remoteIp(req),
             port: portNum,
@@ -155,74 +436,178 @@ export function register(router, ctx) {
     });
 
     router.post('/peer/pair/result', (req, res) => {
-        const { me, name } = parts(req);
-        const offer = liveOffer(req.userHandle);
+        const { me, name, platform, handle } = parts(req);
+        const offer = liveOffer(handle);
+        const dMap = getDirectRequestMap(handle);
         const { requestId, code } = req.body || {};
-        const request = offer?.requests.get(requestId);
-        if (!request || !safeEqual(code, offer.code)) return res.status(404).json({ error: 'No such pairing request' });
-        if (request.status === 'approved') return res.json({ status: 'approved', device: { id: me.deviceId, name }, proof: request.proof });
+        const fromOffer = offer?.requests.get(requestId);
+        const fromDirect = dMap.get(requestId);
+        const request = fromOffer || fromDirect;
+        const expectedCode = fromOffer ? offer.code : fromDirect?.code;
+        if (!request || !expectedCode || !safeEqual(code, expectedCode)) {
+            return res.status(404).json({ error: 'No such pairing request' });
+        }
+        if (request.status === 'approved') {
+            return res.json({ status: 'approved', device: { id: me.deviceId, name, platform }, proof: request.proof });
+        }
         if (request.status === 'denied') return res.json({ status: 'denied' });
-        if (offer.expiresAt < Date.now()) return res.json({ status: 'expired' });
+        const expiresAt = fromOffer ? offer.expiresAt : request.expiresAt;
+        if (expiresAt < Date.now()) return res.json({ status: 'expired' });
         res.json({ status: 'pending' });
     });
 
-    // ── pairing: the scanning device's own page ─────────────
+    // ── pairing: the joining device's own page (QR link, Nearby device, or Manual IP) ──
 
-    router.post('/pairing/join', async (req, res) => {
-        const { store, me, name, port } = parts(req);
-        const offer = parsePairLink(req.body?.link);
-        if (!offer) return res.status(400).json({ error: 'That is not a LAN Sync pairing link' });
-        if (offer.id === me.deviceId) return res.status(400).json({ error: 'That code is this device\'s own. Scan it with the other device.' });
-        if (offer.expiresAt < Date.now()) return res.status(410).json({ error: 'That pairing code has expired. Show a new one.' });
-
+    async function streamJoinHandshake(req, res, target) {
+        const { store, me, name, platform, port } = parts(req);
         const hangUp = new AbortController();
         res.on('close', () => { if (!res.writableEnded) hangUp.abort(); });
         res.setHeader('Content-Type', 'application/x-ndjson');
         const line = (obj) => res.write(`${JSON.stringify(obj)}\n`);
 
         const keys = keyPair();
-        // every address the code names is asked at once; the first Σ to answer is the one paired with
-        line({ step: 'contacting', name: offer.name });
-        const address = await firstReachable(offer.addresses, { signal: hangUp.signal });
+        line({ step: 'contacting', name: target.name });
+        const address = await firstReachable(target.addresses, { signal: hangUp.signal });
         if (hangUp.signal.aborted) return;
         if (!address) {
-            return res.end(`${JSON.stringify({ error: `Could not reach ${offer.name} at ${offer.addresses.join(', ')}. Check both devices are on the same network.` })}\n`);
+            return res.end(`${JSON.stringify({ error: `Could not reach ${target.name} at ${target.addresses.join(', ')}. Check both devices are on the same network.` })}\n`);
         }
         line({ step: 'reached', address });
+
+        let offerId = target.id;
+        let offerName = target.name;
+        let offerPlatform = target.platform || 'device';
+        let offerKey = target.key;
+        let offerCode = target.code || randomId(12);
+
+        if (target.direct && (!offerId || !offerKey)) {
+            try {
+                const infoResp = await fetch(`http://${address}/api/ext/lan-sync/peer/pair/info`, {
+                    signal: AbortSignal.any([hangUp.signal, AbortSignal.timeout(5000)]),
+                });
+                if (!infoResp.ok) throw new Error(`HTTP ${infoResp.status}`);
+                const info = await infoResp.json();
+                offerId = info.id;
+                offerName = info.name || offerName;
+                offerPlatform = info.platform || offerPlatform;
+                offerKey = info.key;
+                discovery.recordProbedPeer({
+                    id: offerId,
+                    name: offerName,
+                    platform: offerPlatform,
+                    address,
+                    port: info.port,
+                    publicKey: offerKey,
+                });
+            } catch (e) {
+                if (hangUp.signal.aborted) return;
+                return res.end(`${JSON.stringify({ error: `Could not read LAN Sync info from ${address}: ${e.message}` })}\n`);
+            }
+        }
+
+        if (offerId === me.deviceId) {
+            return res.end(`${JSON.stringify({ error: 'That address belongs to this device itself.' })}\n`);
+        }
+
+        // If already paired with this device and connected manually, update its address in place
+        const existingPeer = store.peer(offerId);
+        if (existingPeer && target.manualConnect) {
+            store.updatePeer(offerId, { address, name: offerName, platform: offerPlatform });
+            return res.end(`${JSON.stringify({ step: 'paired', name: existingPeer.customName || offerName, updatedAddress: true })}\n`);
+        }
+
         let requestId;
         try {
             const answer = await pairingCall(address, '/peer/pair/request', {
-                code: offer.code, device: { id: me.deviceId, name }, key: keys.publicKey, port,
+                code: offerCode,
+                direct: Boolean(target.direct),
+                device: { id: me.deviceId, name, platform },
+                key: keys.publicKey,
+                port,
             }, { timeout: 5000, signal: hangUp.signal });
             requestId = answer.requestId;
+            if (answer.code) offerCode = answer.code;
+            if (answer.key) offerKey = answer.key;
         } catch (e) {
             if (hangUp.signal.aborted) return;
-            return res.end(`${JSON.stringify({ error: `${offer.name} refused the pairing: ${e.message}` })}\n`);
+            return res.end(`${JSON.stringify({ error: `${offerName} refused the pairing: ${e.message}` })}\n`);
         }
 
-        line({ step: 'confirm', name: offer.name, code: shortCode(offer.key, keys.publicKey, offer.code) });
+        line({ step: 'confirm', name: offerName, code: shortCode(offerKey, keys.publicKey, offerCode) });
         while (!hangUp.signal.aborted) {
             await new Promise(r => setTimeout(r, 1200));
             let answer;
             try {
-                answer = await pairingCall(address, '/peer/pair/result', { requestId, code: offer.code }, { timeout: 4000, signal: hangUp.signal });
+                answer = await pairingCall(address, '/peer/pair/result', { requestId, code: offerCode }, { timeout: 4000, signal: hangUp.signal });
             } catch (e) {
                 if (hangUp.signal.aborted) return;
-                return res.end(`${JSON.stringify({ error: `Lost ${offer.name} while waiting: ${e.message}` })}\n`);
+                return res.end(`${JSON.stringify({ error: `Lost ${offerName} while waiting: ${e.message}` })}\n`);
             }
             if (answer.status === 'pending') continue;
             if (answer.status !== 'approved') {
-                return res.end(`${JSON.stringify({ error: answer.status === 'denied' ? `${offer.name} declined the pairing` : 'The pairing code expired before it was approved' })}\n`);
+                return res.end(`${JSON.stringify({ error: answer.status === 'denied' ? `${offerName} declined the pairing` : 'The pairing request expired before it was approved' })}\n`);
             }
-            const secret = deriveSecret(keys.privateKey, offer.key, { code: offer.code, offerId: offer.id, joinId: me.deviceId });
-            // the proof holds only if the device that approved holds the key the QR code pinned
+            const secret = deriveSecret(keys.privateKey, offerKey, { code: offerCode, offerId, joinId: me.deviceId });
             if (!safeEqual(answer.proof, hmac(secret, `paired|${requestId}`))) {
-                return res.end(`${JSON.stringify({ error: 'The other device did not prove the key its QR code showed. Nothing was paired.' })}\n`);
+                return res.end(`${JSON.stringify({ error: 'The other device did not prove its pairing key. Nothing was paired.' })}\n`);
             }
-            const peerName = String(answer.device?.name || offer.name).slice(0, 60);
-            store.savePeer({ id: offer.id, name: peerName, address, secret, pairedAt: Date.now() });
+            const peerName = String(answer.device?.name || offerName).slice(0, 60);
+            const peerPlatform = String(answer.device?.platform || offerPlatform || 'device').slice(0, 20);
+            store.savePeer({ id: offerId, name: peerName, platform: peerPlatform, address, secret, pairedAt: Date.now() });
             return res.end(`${JSON.stringify({ step: 'paired', name: peerName })}\n`);
         }
+    }
+
+    router.post('/pairing/join', async (req, res) => {
+        const { me } = parts(req);
+        const offer = parsePairLink(req.body?.link);
+        if (!offer) return res.status(400).json({ error: 'That is not a LAN Sync pairing link' });
+        if (offer.id === me.deviceId) return res.status(400).json({ error: 'That code is this device\'s own. Scan it with the other device.' });
+        if (offer.expiresAt < Date.now()) return res.status(410).json({ error: 'That pairing code has expired. Show a new one.' });
+        await streamJoinHandshake(req, res, {
+            id: offer.id,
+            name: offer.name,
+            addresses: offer.addresses,
+            code: offer.code,
+            key: offer.key,
+            direct: false,
+        });
+    });
+
+    router.post('/pairing/direct', async (req, res) => {
+        const { me } = parts(req);
+        const { deviceId, address } = req.body || {};
+        if (deviceId) {
+            const nearby = discovery.snapshot().find(d => d.id === deviceId);
+            if (!nearby && !address) {
+                return res.status(404).json({ error: 'Device is no longer nearby. Refresh and try again.' });
+            }
+            if (deviceId === me.deviceId) {
+                return res.status(400).json({ error: 'Cannot pair a device with itself' });
+            }
+            const addresses = nearby?.addresses?.length ? nearby.addresses : [normalizeManualAddress(address)].filter(Boolean);
+            await streamJoinHandshake(req, res, {
+                id: nearby?.id || deviceId,
+                name: nearby?.name || address || 'Nearby device',
+                platform: nearby?.platform || 'device',
+                addresses,
+                key: nearby?.publicKey || null,
+                direct: true,
+            });
+            return;
+        }
+        const cleanAddr = normalizeManualAddress(address);
+        if (!cleanAddr) {
+            return res.status(400).json({ error: 'Enter an IP address and port, such as 192.168.1.20:7788' });
+        }
+        await streamJoinHandshake(req, res, {
+            id: null,
+            name: cleanAddr,
+            addresses: [cleanAddr],
+            key: null,
+            direct: true,
+            manualConnect: true,
+        });
     });
 
     // ── paired devices ──────────────────────────────────────
@@ -231,9 +616,12 @@ export function register(router, ctx) {
         const { store } = parts(req);
         const fields = {};
         if (typeof req.body?.address === 'string') {
-            const address = req.body.address.trim();
-            if (!/^[^\s/]+:\d{1,5}$/.test(address)) return res.status(400).json({ error: 'An address is host:port, such as 192.168.1.20:7788' });
+            const address = normalizeManualAddress(req.body.address);
+            if (!address) return res.status(400).json({ error: 'An address is host:port, such as 192.168.1.20:7788' });
             fields.address = address;
+        }
+        if (typeof req.body?.customName === 'string') {
+            fields.customName = req.body.customName.trim().slice(0, 60);
         }
         const peer = store.updatePeer(req.params.id, fields);
         if (!peer) return res.status(404).json({ error: 'No such paired device' });
@@ -243,7 +631,13 @@ export function register(router, ctx) {
 
     router.delete('/peers/:id', (req, res) => {
         const { store } = parts(req);
-        res.json({ removed: store.removePeer(req.params.id) });
+        const removed = store.removePeer(req.params.id);
+        const auto = store.automation();
+        if (auto.targetId === req.params.id) {
+            store.saveAutomation({ enabled: false, targetId: '' });
+            ensureAutomationTimer(req);
+        }
+        res.json({ removed });
     });
 
     const startPull = (req, peerRecord, options, label) => {
@@ -273,6 +667,7 @@ export function register(router, ctx) {
         const record = store.peer(req.params.id);
         if (!record) return res.status(404).json({ error: 'No such paired device' });
         const options = syncOptions(req.db);
+        const displayName = record.customName || record.name;
         if (req.body?.dryRun) {
             const peer = peerClient({ address: record.address, deviceId: me.deviceId, secret: record.secret });
             try {
@@ -282,7 +677,7 @@ export function register(router, ctx) {
                 return res.status(502).json({ error: e.message });
             }
         }
-        res.json(startPull(req, record, options, `Syncing from ${record.name}`));
+        res.json(startPull(req, record, options, `Syncing from ${displayName}`));
     });
 
     router.post('/peers/:id/push', async (req, res) => {
@@ -328,8 +723,8 @@ export function register(router, ctx) {
     };
 
     router.post('/peer/hello', signed, (req, res) => {
-        const { me, name } = parts(req);
-        res.json({ device: { id: me.deviceId, name }, version: ctx.manifest.version, datasets: DATASETS });
+        const { me, name, platform } = parts(req);
+        res.json({ device: { id: me.deviceId, name, platform }, version: ctx.manifest.version, datasets: DATASETS });
     });
 
     router.post('/peer/manifest', signed, async (req, res, next) => {
@@ -492,7 +887,8 @@ export function register(router, ctx) {
             overwrite: asked.overwrite === 'prefer-newer' ? 'prefer-newer' : 'exact',
             mode: own.mode,
         };
-        const job = startPull(req, record, options, `Syncing from ${record.name} (sent from it)`);
+        const displayName = record.customName || record.name;
+        const job = startPull(req, record, options, `Syncing from ${displayName} (sent from it)`);
         res.json({ accepted: true, jobId: job.id });
     });
 }
