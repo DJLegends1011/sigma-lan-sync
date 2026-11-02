@@ -14,6 +14,13 @@ export default {
             run: () => panel.open(),
         });
 
+        ctx.ui.addAction('character', {
+            id: 'merge-duplicate',
+            label: 'Merge Duplicate Into...',
+            icon: 'fa-code-merge',
+            run: ({ character }) => panel.openMergeDuplicate({ character }),
+        });
+
         ctx.ui.addSettingsSection((el) => panel.renderSettings(el));
 
         // a pairing link opened in this Σ (a phone's camera hands it here): open the panel on it

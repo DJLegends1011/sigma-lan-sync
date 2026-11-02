@@ -4,6 +4,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { resolveMediaFile } from '../server/sync.js';
 
 const deviceScript = fileURLToPath(new URL('./support/device.mjs', import.meta.url));
 
@@ -479,7 +480,14 @@ test('a persona with an x_evolutia_personas row and ext/evolutia/ files arrives 
 });
 
 test('prefer-newer uses x_evolutia_personas.updated_at so a newer Evolutia definition arrives even when base persona was edited later on target', async () => {
-    // 1. On phone, add a third Alter Ego ("Black Widow") via PUT /personas/:id/definition (updates x_evolutia_personas.updated_at)
+    // 1. First give desktop a newer x_evolutia_personas.updated_at than the initial sync by saving Commander's definition on desktop
+    const deskInitialDef = (await desk.api(`/ext/evolutia/personas/${ids.deskPersona}`)).body.definition;
+    await sleep(30);
+    const deskSave = await desk.api(`/ext/evolutia/personas/${ids.deskPersona}/definition`, 'PUT', { definition: deskInitialDef });
+    assert.equal(deskSave.status, 200);
+
+    // 2. Then on phone (after desktop's Evolutia save), add a third Alter Ego ("Black Widow") via PUT /personas/:id/definition.
+    // This must advance phone's x_evolutia_personas.updated_at past desktop's x_evolutia_personas.updated_at!
     const cur = (await phone.api(`/ext/evolutia/personas/${ids.deskPersona}`)).body.definition;
     cur.alterEgos.push({
         ...cur.alterEgos[1],
@@ -492,14 +500,14 @@ test('prefer-newer uses x_evolutia_personas.updated_at so a newer Evolutia defin
     const savedDef = await phone.api(`/ext/evolutia/personas/${ids.deskPersona}/definition`, 'PUT', { definition: cur });
     assert.equal(savedDef.status, 200);
 
-    // 2. Later on desktop, edit Commander's pronouns (updates personas.updated_at on desktop, leaving desktop's x_evolutia_personas.updated_at older)
+    // 3. Later on desktop, edit Commander's pronouns (updates personas.updated_at on desktop, leaving desktop's x_evolutia_personas.updated_at older than phone's)
     await sleep(30);
     const pPatch = await desk.api(`/personas/${ids.deskPersona}`, 'PATCH', {
         pronouns: { sub: 'he', obj: 'him', poss: 'his', possP: 'his', ref: 'himself' },
     });
     assert.equal(pPatch.status, 200, JSON.stringify(pPatch.body));
 
-    // 3. Pull on desktop with overwrite = prefer-newer
+    // 4. Pull on desktop with overwrite = prefer-newer
     await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'prefer-newer' });
     await pull(desk, phoneId);
 
@@ -515,7 +523,16 @@ test('prefer-newer uses x_evolutia_personas.updated_at so a newer Evolutia defin
 });
 
 test('peer file route refuses undeclared extension folders and internal seeded-prompts.json marker', async () => {
-    // Trigger seed-prompts on phone so seeded-prompts.json exists in phone's ext/evolutia/
+    // 1. Unit check on resolveMediaFile: undeclared extension folders and seeded-prompts.json are refused
+    const fakePaths = { root: '/tmp/sigma-test-root' };
+    const allowed = new Set(['evolutia']);
+    assert.equal(resolveMediaFile(fakePaths, 'ext', 'undeclared-ext/secret.txt', allowed), null, 'undeclared ext/<id>/ refused');
+    assert.equal(resolveMediaFile(fakePaths, 'ext', 'lan-sync/peers.json', allowed), null, 'lan-sync own folder refused');
+    assert.equal(resolveMediaFile(fakePaths, 'ext', 'evolutia/seeded-prompts.json', allowed), null, 'seeded-prompts.json refused');
+    assert.equal(resolveMediaFile(fakePaths, 'ext', 'evolutia/.hidden', allowed), null, 'dotfile refused');
+    assert.ok(resolveMediaFile(fakePaths, 'ext', 'evolutia/ollie.png', allowed), 'declared evolutia file allowed');
+
+    // 2. End-to-end check: trigger seed-prompts on phone so seeded-prompts.json exists in phone's ext/evolutia/
     await phone.api('/ext/evolutia/seed-prompts', 'POST', {});
     await pull(desk, phoneId);
     // Desk's assistant-prompts were never seeded yet; verify seeded-prompts.json did NOT sync across to block seeding on desk
@@ -524,7 +541,7 @@ test('peer file route refuses undeclared extension folders and internal seeded-p
     assert.equal(seedOnDesk.body.seeded, true, 'seeded-prompts.json marker was not synced from phone');
 });
 
-test('same card imported on both devices and edited on one (e.g. Evolutia enabled) still pairs as one character and attaches chats', async () => {
+test('same card imported on both devices and edited on one (with creator) pairs as one character; unrelated same-name cards can be merged via /characters/merge', async () => {
     const card = { name: 'Vannessa', description: 'Popular campus girl.', first_mes: 'Ugh...', creator: 'wisperrr' };
     const onDesk = await desk.call('importCard', card);
     const onPhone = await phone.call('importCard', card);
@@ -548,4 +565,22 @@ test('same card imported on both devices and edited on one (e.g. Evolutia enable
     assert.equal(vannessas[0].ext?.evolutia?.on, 1, 'Evolutia state updated on the matched character');
     const deskChats = (await desk.api(`/chats?charId=${onDesk.id}`)).body.items.map(c => c.name);
     assert.ok(deskChats.includes('Vannessa - phone branch'), 'phone chat attached to desktop Vannessa');
+
+    // Now test /characters/merge on two separate characters on desktop
+    const dupA = await desk.call('importCard', { name: 'DupHero', description: 'Version A', first_mes: 'A' });
+    const dupB = await desk.call('importCard', { name: 'DupHero', description: 'Version B', first_mes: 'B' });
+    const dupChat = await desk.api(`/characters/${dupB.id}/chats`, 'POST', {
+        name: 'DupHero - chat on B',
+        messages: [{ name: 'DupHero', is_user: false, mes: 'From B!', send_date: 1700000300000 }],
+    });
+    assert.ok(dupChat.status < 300);
+
+    const merged = await desk.ext('/characters/merge', 'POST', { fromId: dupB.id, intoId: dupA.id });
+    assert.equal(merged.status, 200, JSON.stringify(merged.body));
+    assert.equal(merged.body.movedChats, 1);
+    assert.equal(merged.body.chatCount, 1);
+    assert.equal((await desk.api(`/characters/${dupB.id}`)).status, 404, 'duplicate copy deleted');
+    const keptRow = (await desk.api(`/characters/${dupA.id}`)).body;
+    assert.equal(keptRow.chatCount, 1, 'chat_count recounted on original');
+    assert.ok(keptRow.lastChatAt > 0, 'last_chat_at recounted on original');
 });

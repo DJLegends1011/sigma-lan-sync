@@ -94,10 +94,24 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
         const srcList = source.personas || [];
         const tgtList = target.personas || [];
         const byId = new Map(tgtList.map(p => [p.id, p]));
-        const byName = new Map(tgtList.map(p => [nameKey(p), p]));
+        const srcNameCounts = new Map();
+        const tgtNameCounts = new Map();
+        for (const s of srcList) {
+            const k = nameKey(s);
+            if (k) srcNameCounts.set(k, (srcNameCounts.get(k) || 0) + 1);
+        }
+        for (const t of tgtList) {
+            const k = nameKey(t);
+            if (k) tgtNameCounts.set(k, (tgtNameCounts.get(k) || 0) + 1);
+        }
+        const byUniqueName = new Map();
+        for (const t of tgtList) {
+            const k = nameKey(t);
+            if (k && tgtNameCounts.get(k) === 1 && srcNameCounts.get(k) === 1) byUniqueName.set(k, t);
+        }
         const matchedTargetIds = new Set();
         for (const s of srcList) {
-            const t = byId.get(s.id) || byName.get(nameKey(s));
+            const t = byId.get(s.id) || byUniqueName.get(nameKey(s));
             if (!t) {
                 plan.personas.create.push({ id: s.id, name: s.name });
                 continue;
@@ -270,12 +284,13 @@ export function alignSource(source, target, aliases = {}) {
     // 2. Same provider link (provider_links: same site + remote id)
     pairUniqueByKeys(c => Array.isArray(c.providerLinks) ? c.providerLinks : []);
 
-    // 3. Same (name, creator, createDate) when uniquely matching 1-to-1 each way
+    // 3. Same (name, creator, createDate) when uniquely matching 1-to-1 each way, and at least one of creator/createDate is non-empty
     pairUniqueByKeys((c) => {
         const nm = nameKey(c);
         if (!nm) return [];
         const cr = String(c.creator || '').trim().toLowerCase();
         const dt = String(c.createDate || '').trim();
+        if (!cr && !dt) return [];
         return [`${nm}\u0000${cr}\u0000${dt}`];
     });
 

@@ -121,3 +121,34 @@ test('personas, presets and playlists match by id or name, translate member alia
     assert.equal(plan.kept, 1);
     assert.deepEqual(plan.playlists.create, [{ id: 'pl-src', name: 'Sci-Fi', members: ['t-char'] }]);
 });
+
+test('alignSource does not pair unrelated cards that only share a name when creator and createDate are empty, and pairs by providerLinks or non-empty creator', () => {
+    const source1 = { characters: [char('s1', { name: 'Alice', card: 'c1', creator: '', createDate: '' })], chats: [], worlds: [] };
+    const target1 = { characters: [char('t1', { name: 'Alice', card: 'c2', creator: '', createDate: '' })], chats: [], worlds: [] };
+    assert.deepEqual(alignSource(source1, target1, {}).aliases, {}, 'name-only with empty creator/createDate is not paired');
+
+    const source2 = { characters: [char('s1', { name: 'Alice', card: 'c1', creator: 'wisperrr', createDate: '' })], chats: [], worlds: [] };
+    const target2 = { characters: [char('t1', { name: 'Alice', card: 'c2', creator: 'wisperrr', createDate: '' })], chats: [], worlds: [] };
+    assert.deepEqual(alignSource(source2, target2, {}).aliases, { s1: 't1' }, 'unique name + non-empty creator pairs');
+
+    const source3 = { characters: [char('s1', { name: 'Alice', card: 'c1', providerLinks: ['chub:123'] })], chats: [], worlds: [] };
+    const target3 = { characters: [char('t1', { name: 'Alice', card: 'c2', providerLinks: ['chub:123'] })], chats: [], worlds: [] };
+    assert.deepEqual(alignSource(source3, target3, {}).aliases, { s1: 't1' }, 'unique providerLink pairs');
+});
+
+test('personas do not match by name when two personas share the same name on either side', () => {
+    const source = {
+        characters: [], chats: [], worlds: [],
+        personas: [{ id: 'p-src', name: 'Alex', digest: 'd1', updatedAt: 10 }],
+    };
+    const target = {
+        characters: [], chats: [], worlds: [],
+        personas: [
+            { id: 'p-t1', name: 'Alex', digest: 'd2', updatedAt: 5 },
+            { id: 'p-t2', name: 'alex', digest: 'd3', updatedAt: 6 },
+        ],
+    };
+    const plan = makePlan(source, target, { datasets: all, mode: 'incremental', overwrite: 'exact' });
+    assert.equal(plan.personas.update.length, 0);
+    assert.deepEqual(plan.personas.create, [{ id: 'p-src', name: 'Alex' }]);
+});

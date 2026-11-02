@@ -871,7 +871,7 @@ export function register(router, ctx) {
         const { store } = parts(req);
         const { fromId, intoId, peerId = null } = req.body || {};
         try {
-            const out = mergeDuplicateCharacter(req.db, req.paths, store, { fromId, intoId, peerId });
+            const out = mergeDuplicateCharacter(req.db, req.paths, store, { fromId, intoId, peerId, ctx });
             res.json(out);
         } catch (e) {
             res.status(400).json({ error: e.message });

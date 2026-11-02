@@ -92,6 +92,13 @@ export function createPanel(ctx) {
         onClose: () => teardown(),
     });
 
+    const mergeDialog = ctx.ui.dialog({
+        id: 'merge-duplicate',
+        label: 'Merge Duplicate Character',
+        icon: 'fa-code-merge',
+        className: 'ls-dialog',
+    });
+
     const region = (name) => body?.querySelector(`[data-ls-region="${name}"]`);
 
     function teardown() {
@@ -702,6 +709,10 @@ export function createPanel(ctx) {
                     paintOptions();
                     break;
                 }
+                case 'merge-duplicate': {
+                    await openMergeDuplicate();
+                    break;
+                }
                 default:
             }
         } catch (e) {
@@ -749,7 +760,113 @@ export function createPanel(ctx) {
         }
     }
 
+    async function openMergeDuplicate({ character = null } = {}) {
+        let chars = [];
+        try {
+            const resp = await CoreAPI.apiRequest('/characters?limit=1000&count=false', 'GET');
+            const data = resp.ok ? await resp.json() : null;
+            chars = Array.isArray(data?.items) ? data.items : [];
+        } catch (e) {
+            CoreAPI.showToast(`Could not load characters: ${why(e)}`, 'error');
+            return;
+        }
+        if (chars.length < 2) {
+            CoreAPI.showToast('Need at least two characters in the library to merge duplicates', 'info');
+            return;
+        }
+
+        // Preselect copy (`fromId`) and original (`intoId`)
+        let defaultFrom = character?.id || '';
+        let defaultInto = '';
+        if (!defaultFrom) {
+            const byName = new Map();
+            for (const c of chars) {
+                const k = String(c.name || '').trim().toLowerCase();
+                if (!byName.has(k)) byName.set(k, []);
+                byName.get(k).push(c);
+            }
+            for (const group of byName.values()) {
+                if (group.length >= 2) {
+                    const sorted = [...group].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+                    defaultInto = sorted[0].id;
+                    defaultFrom = sorted[sorted.length - 1].id;
+                    break;
+                }
+            }
+        }
+        if (!defaultFrom) defaultFrom = chars[0].id;
+        if (!defaultInto) {
+            const fromChar = chars.find(c => c.id === defaultFrom);
+            const sameName = chars.find(c => c.id !== defaultFrom && String(c.name || '').trim().toLowerCase() === String(fromChar?.name || '').trim().toLowerCase());
+            defaultInto = sameName?.id || chars.find(c => c.id !== defaultFrom)?.id || '';
+        }
+
+        const mBody = mergeDialog.open({ title: 'Merge Duplicate Character' });
+        const root = document.createElement('div');
+        root.className = 'ls-panel';
+        mBody.replaceChildren(root);
+
+        const optionHtml = (c, selectedId) => {
+            const chats = c.chatCount ?? 0;
+            return `<option value="${esc(c.id)}"${c.id === selectedId ? ' selected' : ''}>${esc(c.name || 'Unnamed')} (${chats} chat${chats === 1 ? '' : 's'} · ${esc(c.id.slice(0, 8))})</option>`;
+        };
+
+        root.innerHTML = `
+            <section class="ls-section">
+                <p class="ls-muted">Moves all chats, gallery pictures, tags, lorebook links, and extension data from the duplicate copy onto the original character, deletes the duplicate copy, and records the alias so future syncs won't recreate it.</p>
+                <div class="settings-row">
+                    <label for="ls-merge-from">Duplicate copy (will be merged &amp; deleted)</label>
+                    <select id="ls-merge-from" class="cl-select-fluid">${chars.map(c => optionHtml(c, defaultFrom)).join('')}</select>
+                </div>
+                <div class="settings-row">
+                    <label for="ls-merge-into">Original character (kept)</label>
+                    <select id="ls-merge-into" class="cl-select-fluid">${chars.map(c => optionHtml(c, defaultInto)).join('')}</select>
+                </div>
+                <div class="ls-verbs">
+                    <button type="button" class="cl-btn cl-btn-sm cl-btn-primary" data-ls-merge="confirm"><i class="fa-solid fa-code-merge" aria-hidden="true"></i> Merge Duplicate</button>
+                    <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-merge="cancel">Cancel</button>
+                </div>
+            </section>`;
+        root.querySelectorAll('select').forEach(s => CoreAPI.initCustomSelect?.(s));
+
+        root.addEventListener('click', async (ev) => {
+            const btn = ev.target.closest('[data-ls-merge]');
+            if (!btn) return;
+            if (btn.dataset.lsMerge === 'cancel') {
+                await mergeDialog.close();
+                return;
+            }
+            const fromId = root.querySelector('#ls-merge-from')?.value || '';
+            const intoId = root.querySelector('#ls-merge-into')?.value || '';
+            if (!fromId || !intoId || fromId === intoId) {
+                CoreAPI.showToast('Pick two different characters (the duplicate copy and the original)', 'warning');
+                return;
+            }
+            const fromChar = chars.find(c => c.id === fromId);
+            const intoChar = chars.find(c => c.id === intoId);
+            const ok = await CoreAPI.showConfirm({
+                title: `Merge "${fromChar?.name || fromId}" into "${intoChar?.name || intoId}"?`,
+                message: `All chats, gallery items, tags, and lorebooks from "${fromChar?.name || fromId}" (${fromId.slice(0, 8)}) will move onto "${intoChar?.name || intoId}" (${intoId.slice(0, 8)}), and the duplicate copy will be deleted.`,
+                confirmLabel: 'Merge & Delete Copy',
+                danger: true,
+            });
+            if (!ok) return;
+            btn.disabled = true;
+            try {
+                const res = await call('/characters/merge', 'POST', { fromId, intoId });
+                await mergeDialog.close();
+                CoreAPI.showToast(`Merged into ${intoChar?.name || intoId} (${res.movedChats || 0} chat${res.movedChats === 1 ? '' : 's'} moved)`, 'success');
+                await runAfterSyncCommands();
+                if (body) await refresh();
+            } catch (e) {
+                btn.disabled = false;
+                CoreAPI.showToast(why(e), 'error');
+            }
+        });
+    }
+
     return {
+        openMergeDuplicate,
         async open({ joinLink = null } = {}) {
             body = dialog.open({ title: 'LAN Sync' });
             body.innerHTML = `
@@ -772,6 +889,7 @@ export function createPanel(ctx) {
                         <div class="ls-section-head">
                             <h3 class="ls-heading">Devices</h3>
                             <div class="ls-verbs">
+                                <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-act="merge-duplicate" title="Merge a duplicate character into the original"><i class="fa-solid fa-code-merge" aria-hidden="true"></i> Merge duplicate</button>
                                 <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-act="connect-manual"><i class="fa-solid fa-link" aria-hidden="true"></i> Connect manually</button>
                                 <button type="button" class="cl-btn cl-btn-sm cl-btn-secondary" data-ls-act="refresh-nearby" title="Refresh nearby devices"><i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i> Refresh</button>
                             </div>
