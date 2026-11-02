@@ -992,7 +992,9 @@ test('versions (card version history) merges by content identity (created_at, sh
     assert.equal(new Set(deskVers.map(s => s.id)).size, 4, 'desktop snap_ids are unique');
     assert.equal(new Set(phoneVers.map(s => s.id)).size, 4, 'phone snap_ids are unique');
 
-    // Syncing again changes nothing
+    // Syncing again changes nothing, even if the two devices have different pre-restore backup slots (snap_id = -1)
+    await desk.api(`/versions/char/${deskVannessa.id}/backup`, 'PUT', { timestamp: 1700000100000, data: { description: 'Desk Backup' } });
+    await phone.api(`/versions/char/${phoneVannessa.id}/backup`, 'PUT', { timestamp: 1700000200000, data: { description: 'Phone Backup' } });
     assert.deepEqual(nothingToDo(await dryRun(desk, phoneId)), []);
     assert.deepEqual(nothingToDo(await dryRun(phone, deskId)), []);
 

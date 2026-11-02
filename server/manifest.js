@@ -256,7 +256,7 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
         } catch { /* ignore if table absent */ }
         let versionRows = [];
         try {
-            versionRows = db.prepare('SELECT char_id, snap_id, created_at, data FROM versions ORDER BY char_id, created_at, snap_id').all();
+            versionRows = db.prepare('SELECT char_id, snap_id, created_at, data FROM versions WHERE snap_id >= 0 ORDER BY char_id, created_at, snap_id').all();
         } catch { /* ignore if table absent */ }
         const mediaRows = db.prepare("SELECT char_id, COUNT(*) AS n, GROUP_CONCAT(COALESCE(content_hash, file || ':' || COALESCE(size, 0)), '|') AS sig FROM (SELECT char_id, content_hash, file, size FROM media ORDER BY char_id, display_name) GROUP BY char_id").all();
         let studioRows = [];
@@ -323,11 +323,7 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
                 : 0;
             const vList = versionsByChar.get(c.id) || [];
             const versionKeys = [
-                ...new Set(
-                    vList.map(v => (v.snap_id === -1
-                        ? `backup:${v.created_at ?? 0}:${sha256(String(v.data ?? ''))}`
-                        : `${v.created_at ?? 0}:${sha256(String(v.data ?? ''))}`))
-                ),
+                ...new Set(vList.map(v => `${v.created_at ?? 0}:${sha256(String(v.data ?? ''))}`)),
             ];
             const charAliases = aliasesByChar.get(c.id) || [];
             let creator = '';
