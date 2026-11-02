@@ -231,6 +231,10 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
     const want = new Set(datasets);
     const cache = store.digestCache();
     const fresh = { chars: {}, chats: {}, personas: {} };
+    let profileIds = [];
+    try {
+        profileIds = db.prepare('SELECT id FROM llm_profiles ORDER BY id').all().map(r => r.id);
+    } catch { /* ignore if table absent */ }
     const manifest = {
         characters: [],
         chats: [],
@@ -243,6 +247,8 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
         appStore: [],
         unboundStudio: [],
         connections: [],
+        profileIds,
+        installedExtensions: [...installedExtensionIds()],
     };
 
     if (want.has('characters') || want.has('chats') || want.has('playlists')) {
@@ -303,6 +309,8 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
                     id: s.id,
                     name: s.name || '',
                     updatedAt: s.updated_at ?? 0,
+                    profileId: s.profile_id || null,
+                    baseDigest: sha256(canon({ name: s.name || '', draft: s.draft || '{}', messages: s.messages || '[]' })),
                     digest: sha256(canon({ name: s.name || '', draft: s.draft || '{}', messages: s.messages || '[]', profileId: s.profile_id || null })),
                 });
             }
@@ -314,7 +322,15 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
                 : { etag: '', avatar: '' };
             fresh.chars[c.id] = av;
             const m = mediaByChar.get(c.id) || { count: 0, sig: '' };
+            const mediaKeys = m.sig ? m.sig.split('|').filter(Boolean) : [];
             const stList = studioByChar.get(c.id) || [];
+            const studioSessions = stList.map(s => ({
+                id: s.id,
+                updatedAt: Number(s.updated_at) || 0,
+                profileId: s.profile_id || null,
+                baseDigest: sha256(canon({ name: s.name || '', draft: s.draft || '{}', messages: s.messages || '[]' })),
+                digest: sha256(canon({ name: s.name || '', draft: s.draft || '{}', messages: s.messages || '[]', profileId: s.profile_id || null })),
+            }));
             const studioDigest = stList.length
                 ? sha256(canon(stList.map(s => ({ id: s.id, name: s.name || '', draft: s.draft || '{}', messages: s.messages || '[]', profileId: s.profile_id || null }))))
                 : '';
@@ -343,16 +359,17 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
                 updatedAt: c.updated_at ?? 0,
                 studioUpdatedAt,
                 studioDigest,
+                studioSessions,
                 versionKeys,
                 mediaCount: m.count,
                 mediaSig: sha256(m.sig),
+                mediaKeys,
                 card: sha256(`${c.content_hash || sha256(c.card)}|${av.avatar}`),
                 meta: sha256(canon({
                     tags: tagsByChar.get(c.id) || [],
                     fav: !!c.fav,
                     updateLocked: !!c.update_locked,
                     worlds: worldsByChar.get(c.id) || [],
-                    aliases: charAliases,
                 })),
             });
         }
@@ -390,6 +407,13 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
             fresh.chats[ch.id] = { key, rows: rowsDigest };
             const baseDigest = sha256(`${rowsDigest}|${ch.chat_metadata || '{}'}|${ch.draft || ''}|${ch.persona_id || ''}|${ch.preset_id || ''}|${(worldsByChat.get(ch.id) || []).join(',')}`);
             const asstList = asstByChat.get(ch.id) || [];
+            const asstSessions = asstList.map(a => ({
+                id: a.id,
+                updatedAt: Number(a.updated_at) || 0,
+                profileId: a.profile_id || null,
+                baseDigest: sha256(canon({ name: a.name || '', messages: a.messages || '[]' })),
+                digest: sha256(canon({ name: a.name || '', messages: a.messages || '[]', profileId: a.profile_id || null })),
+            }));
             const asstDigest = asstList.length
                 ? sha256(canon(asstList.map(a => ({ id: a.id, name: a.name || '', messages: a.messages || '[]', profileId: a.profile_id || null }))))
                 : '';
@@ -404,6 +428,7 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
                 asstUpdatedAt,
                 baseDigest,
                 asstDigest,
+                asstSessions,
                 messageCount: ch.message_count ?? 0,
                 digest: asstDigest ? sha256(`${baseDigest}|${asstDigest}`) : baseDigest,
             });
@@ -555,16 +580,22 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
         for (const r of rows) {
             if (!isAllowedSettingKey(r.key, { includeConnections, includeSecrets })) continue;
             let extensions;
+            let profileId;
             if (r.key === 'enabledExtensions') {
                 try {
                     const parsed = JSON.parse(r.value);
                     if (Array.isArray(parsed)) extensions = parsed.filter(x => typeof x === 'string');
                 } catch { /* ignore */ }
+            } else if (r.key === 'chatProfileId' || r.key === 'assistantProfileId' || r.key.startsWith('aiProfile.')) {
+                let parsed = r.value;
+                try { parsed = JSON.parse(r.value); } catch { /* raw */ }
+                if (typeof parsed === 'string' && parsed) profileId = parsed;
             }
             manifest.settings.push({
                 key: r.key,
                 digest: sha256(String(r.value ?? '')),
                 ...(extensions ? { extensions } : {}),
+                ...(profileId ? { profileId } : {}),
             });
         }
     }

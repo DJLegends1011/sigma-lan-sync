@@ -347,6 +347,24 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                 `).run(worldName, Date.now(), Date.now());
             };
 
+            // ── 1b. Connections (llm_profiles, synced before studio/assistant sessions so profile_ids resolve) ──
+            if (want.has('connections')) {
+                const upsertProfile = db.prepare(upsertSql('llm_profiles', ['id']));
+                const syncProfileRow = (srcId, dstId) => {
+                    const rp = db.prepare('SELECT * FROM remote.llm_profiles WHERE id = ?').get(srcId);
+                    if (!rp) return;
+                    upsertProfile.run({ ...rp, id: dstId });
+                };
+                for (const c of plan.connections.create) syncProfileRow(c.id, c.id);
+                for (const c of plan.connections.update) syncProfileRow(c.id, c.targetId);
+                if (mirror) {
+                    for (const delId of plan.connections.delete) {
+                        db.prepare('UPDATE chats SET profile_id = NULL WHERE profile_id = ?').run(delId);
+                        db.prepare('DELETE FROM llm_profiles WHERE id = ?').run(delId);
+                    }
+                }
+            }
+
             // ── 2. Characters (characters, tags, char_tags, char_worlds, provider_links, media, card_versions) ──
             if (want.has('characters')) {
                 const upsertCharCard = db.prepare(upsertSql('characters', ['id'], ['card', 'content_hash', 'token_estimate', 'media_localized', 'lore_dismissed', 'updated_at']));
@@ -689,24 +707,6 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                     if (existsHere && (!locExists || !preferNewer)) {
                         db.prepare("INSERT INTO settings (key, value) VALUES ('activePresetId', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
                             .run(JSON.stringify(mappedId));
-                    }
-                }
-            }
-
-            // ── 5. Connections (llm_profiles, activeProfileId) ──
-            if (want.has('connections')) {
-                const upsertProfile = db.prepare(upsertSql('llm_profiles', ['id']));
-                const syncProfileRow = (srcId, dstId) => {
-                    const rp = db.prepare('SELECT * FROM remote.llm_profiles WHERE id = ?').get(srcId);
-                    if (!rp) return;
-                    upsertProfile.run({ ...rp, id: dstId });
-                };
-                for (const c of plan.connections.create) syncProfileRow(c.id, c.id);
-                for (const c of plan.connections.update) syncProfileRow(c.id, c.targetId);
-                if (mirror) {
-                    for (const delId of plan.connections.delete) {
-                        db.prepare('UPDATE chats SET profile_id = NULL WHERE profile_id = ?').run(delId);
-                        db.prepare('DELETE FROM llm_profiles WHERE id = ?').run(delId);
                     }
                 }
             }

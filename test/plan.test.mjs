@@ -193,3 +193,55 @@ test('isAllowedSettingKey gates ext:<id>:<secret> behind includeSecrets, app_sto
     assert.deepEqual(preferNewerPlan.settings.put, ['allowRichTagline']);
     assert.equal(preferNewerPlan.kept, 1);
 });
+
+test('makePlan does not count target-only assistant/studio sessions in incremental mode or uninstalled enabledExtensions when merge would not change target', () => {
+    const source = {
+        characters: [],
+        chats: [{
+            id: 'chat-alexa',
+            charId: 'char-alexa',
+            name: 'Alexa - 1',
+            updatedAt: 100,
+            asstUpdatedAt: 0,
+            baseDigest: 'b1',
+            asstDigest: '',
+            asstSessions: [],
+            digest: 'b1',
+        }],
+        worlds: [],
+        settings: [{
+            key: 'enabledExtensions',
+            digest: 'src-ext-digest',
+            extensions: ['sigma-pwa', 'lan-sync', 'evolutia'],
+        }],
+    };
+    const target = {
+        characters: [{ id: 'char-alexa', name: 'Alexa', card: 'c1', meta: 'm1', mediaCount: 0, mediaSig: '', updatedAt: 100 }],
+        chats: [{
+            id: 'chat-alexa',
+            charId: 'char-alexa',
+            name: 'Alexa - 1',
+            updatedAt: 100,
+            asstUpdatedAt: 200,
+            baseDigest: 'b1',
+            asstDigest: 'asst-target-only',
+            asstSessions: [{ id: 'asst-1', updatedAt: 200, profileId: null, baseDigest: 'a1', digest: 'a1' }],
+            digest: 'b1|asst-target-only',
+        }],
+        worlds: [],
+        installedExtensions: ['lan-sync', 'evolutia', 'triviumdb'],
+        settings: [{
+            key: 'enabledExtensions',
+            digest: 'tgt-ext-digest',
+            extensions: ['lan-sync', 'triviumdb', 'evolutia'],
+        }],
+    };
+
+    const incPlan = makePlan(source, target, { datasets: ['characters', 'chats', 'settings'], mode: 'incremental', overwrite: 'exact' });
+    assert.deepEqual(incPlan.chats.update, [], 'target-only assistant session is not counted as a change in incremental mode');
+    assert.deepEqual(incPlan.settings.put, [], 'uninstalled remote extension + local-only target extension is not counted when merged list matches target');
+
+    const mirrorPlan = makePlan(source, target, { datasets: ['characters', 'chats', 'settings'], mode: 'mirror', overwrite: 'exact' });
+    assert.equal(mirrorPlan.chats.update.length, 1, 'in mirror mode, target-only assistant session will be removed so it is counted');
+    assert.equal(mirrorPlan.settings.put.includes('enabledExtensions'), true, 'in mirror mode, local-only extension triviumdb will be removed so it is counted');
+});

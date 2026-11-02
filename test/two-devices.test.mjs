@@ -1084,3 +1084,25 @@ test('char_aliases feeds into twin matching and syncs with Characters (mapping c
     assert.equal(deskCarrier.card.data.name, 'AliasCarrier');
     assert.deepEqual(nothingToDo(await dryRun(desk, phoneId)), []);
 });
+
+test('syncing when one side has an extra assistant session and uninstalled enabledExtensions leaves Check at 0 in both directions', async () => {
+    // Give phone an uninstalled extension in enabledExtensions, and give desktop a new assistant session on Nova's chat
+    await phone.api('/settings', 'PUT', {
+        enabledExtensions: ['sigma-pwa', 'lan-sync', 'evolutia'],
+    });
+    const deskAsst = await desk.api('/assistant/sessions', 'POST', {
+        chatId: ids.deskChat,
+        name: 'Desktop-only Assistant Session',
+        messages: [{ role: 'user', content: 'Only on desktop initially' }],
+    });
+    assert.ok(deskAsst.status < 300, JSON.stringify(deskAsst.body));
+
+    // Desktop pulls from phone (incremental): phone has no assistant session on deskAsst, and sigma-pwa is not installed
+    await pull(desk, phoneId);
+    assert.deepEqual(nothingToDo(await dryRun(desk, phoneId)), [], 'Desktop Check shows 0 changes immediately after pulling from phone');
+
+    // Phone pulls from desktop (incremental): phone receives deskAsst, keeps its sigma-pwa enabledExtension, and Check is 0 both ways
+    await pull(phone, deskId);
+    assert.deepEqual(nothingToDo(await dryRun(phone, deskId)), [], 'Phone Check shows 0 changes immediately after pulling from desktop');
+    assert.deepEqual(nothingToDo(await dryRun(desk, phoneId)), [], 'Desktop Check still shows 0 changes');
+});

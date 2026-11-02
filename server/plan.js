@@ -8,6 +8,39 @@
 export const chatKey = (c) => `${c.charId || ''}\u0000${c.name}`;
 export const nameKey = (item) => String(item?.name || '').trim().toLowerCase();
 
+function planSessions(srcList, tgtList, { mirror, preferNewer, validProfileIds }) {
+    const tgtById = new Map((tgtList || []).map(x => [x.id, x]));
+    const srcById = new Map((srcList || []).map(x => [x.id, x]));
+    let sync = false;
+    let kept = false;
+    for (const s of srcList || []) {
+        const t = tgtById.get(s.id);
+        const resolvedProfileId = s.profileId
+            ? (validProfileIds ? (validProfileIds.has(s.profileId) ? s.profileId : null) : s.profileId)
+            : null;
+        if (t) {
+            const sameContent = (s.baseDigest !== undefined && t.baseDigest !== undefined)
+                ? (t.baseDigest === s.baseDigest && (t.profileId || null) === resolvedProfileId)
+                : (t.digest === s.digest);
+            if (sameContent) continue;
+            if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) {
+                kept = true;
+                continue;
+            }
+        }
+        sync = true;
+    }
+    if (mirror) {
+        for (const t of tgtList || []) {
+            if (!srcById.has(t.id)) {
+                sync = true;
+                break;
+            }
+        }
+    }
+    return { sync, kept };
+}
+
 /**
  * @param {{characters: object[], chats: object[], worlds: object[], personas?: object[], presets?: object[], playlists?: object[], backgrounds?: object[], connections?: object[]}} source the device pulled from
  * @param {{characters: object[], chats: object[], worlds: object[], personas?: object[], presets?: object[], playlists?: object[], backgrounds?: object[], connections?: object[]}} target this library
@@ -17,6 +50,14 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
     const want = new Set(datasets);
     const mirror = mode === 'mirror';
     const preferNewer = overwrite === 'prefer-newer';
+    const hasTargetProfileList = Array.isArray(target.profileIds) || Array.isArray(target.connections);
+    const validProfileIds = hasTargetProfileList
+        ? new Set([
+            ...(target.profileIds || []),
+            ...(target.connections || []).map(c => c.id),
+            ...(want.has('connections') ? (source.connections || []).map(c => c.id) : []),
+        ])
+        : null;
     const plan = {
         characters: { create: [], update: [], delete: [] },
         chats: { create: [], update: [], delete: [] },
@@ -42,19 +83,38 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             const t = targetChars.get(s.id);
             if (!t) { plan.characters.create.push(sourceId); continue; }
             const card = s.card !== t.card;
-            const meta = s.meta !== t.meta;
-            const media = s.mediaSig ? s.mediaSig !== t.mediaSig : s.mediaCount > t.mediaCount;
-            const studio = (s.studioDigest || '') !== (t.studioDigest || '');
+            const tgtAliases = new Set(t.charAliases || []);
+            const srcAliases = new Set(s.charAliases || []);
+            const aliasesDiff = (s.charAliases || []).some(a => !tgtAliases.has(a))
+                || (mirror && (t.charAliases || []).some(a => !srcAliases.has(a)));
+            const meta = s.meta !== t.meta || aliasesDiff;
+            let media;
+            if (Array.isArray(s.mediaKeys) && Array.isArray(t.mediaKeys)) {
+                const tgtMedia = new Set(t.mediaKeys);
+                const srcMedia = new Set(s.mediaKeys);
+                media = s.mediaKeys.some(k => !tgtMedia.has(k)) || (mirror && t.mediaKeys.some(k => !srcMedia.has(k)));
+            } else {
+                media = s.mediaSig ? s.mediaSig !== t.mediaSig : s.mediaCount > t.mediaCount;
+            }
+            let syncStudio = false;
+            let studioKept = false;
+            if (Array.isArray(s.studioSessions) && Array.isArray(t.studioSessions)) {
+                const stPlan = planSessions(s.studioSessions, t.studioSessions, { mirror, preferNewer, validProfileIds });
+                syncStudio = stPlan.sync;
+                studioKept = stPlan.kept;
+            } else {
+                const studio = (s.studioDigest || '') !== (t.studioDigest || '') && (mirror || Boolean(s.studioDigest));
+                studioKept = studio && preferNewer && (t.studioUpdatedAt ?? 0) > (s.studioUpdatedAt ?? 0);
+                syncStudio = studio && !studioKept;
+            }
             const tgtVerKeys = new Set(t.versionKeys || []);
             const versions = Array.isArray(s.versionKeys) && s.versionKeys.some(k => !tgtVerKeys.has(k));
-            if (!card && !meta && !media && !studio && !versions) continue;
+            if (!card && !meta && !media && !syncStudio && !studioKept && !versions) continue;
             const cardMetaKept = (card || meta) && preferNewer && t.updatedAt > s.updatedAt;
-            const studioKept = studio && preferNewer && (t.studioUpdatedAt ?? 0) > (s.studioUpdatedAt ?? 0);
             if (cardMetaKept) plan.kept++;
             if (studioKept && !cardMetaKept) plan.kept++;
             const syncCard = card && !cardMetaKept;
             const syncMeta = meta && !cardMetaKept;
-            const syncStudio = studio && !studioKept;
             const syncVersions = versions;
             if (!syncCard && !syncMeta && !media && !syncStudio && !syncVersions) continue;
             plan.characters.update.push({
@@ -76,7 +136,13 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
         for (const s of srcUnbound) {
             const t = tgtUnboundById.get(s.id);
             if (!t) { plan.unboundStudio.put.push(s.id); continue; }
-            if (t.digest === s.digest) continue;
+            const resolvedProfileId = s.profileId
+                ? (validProfileIds ? (validProfileIds.has(s.profileId) ? s.profileId : null) : s.profileId)
+                : null;
+            const sameContent = (s.baseDigest !== undefined && t.baseDigest !== undefined)
+                ? (t.baseDigest === s.baseDigest && (t.profileId || null) === resolvedProfileId)
+                : (t.digest === s.digest);
+            if (sameContent) continue;
             if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) { plan.kept++; continue; }
             plan.unboundStudio.put.push(s.id);
         }
@@ -95,20 +161,28 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             const t = targetById.get(s.id) || targetByKey.get(chatKey(s));
             if (!t) { plan.chats.create.push({ id: s.id, charId: s.charId, name: s.name }); continue; }
             matchedTargetIds.add(t.id);
-            if (t.digest === s.digest && t.name === s.name) continue;
             if (s.baseDigest !== undefined && t.baseDigest !== undefined) {
                 const baseDiff = s.baseDigest !== t.baseDigest || s.name !== t.name;
-                const asstDiff = (s.asstDigest || '') !== (t.asstDigest || '');
+                let syncAsst = false;
+                let asstKept = false;
+                if (Array.isArray(s.asstSessions) && Array.isArray(t.asstSessions)) {
+                    const asstPlan = planSessions(s.asstSessions, t.asstSessions, { mirror, preferNewer, validProfileIds });
+                    syncAsst = asstPlan.sync;
+                    asstKept = asstPlan.kept;
+                } else {
+                    const asstDiff = (s.asstDigest || '') !== (t.asstDigest || '') && (mirror || Boolean(s.asstDigest));
+                    asstKept = asstDiff && preferNewer && (t.asstUpdatedAt ?? 0) > (s.asstUpdatedAt ?? 0);
+                    syncAsst = asstDiff && !asstKept;
+                }
                 const baseKept = baseDiff && preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0);
-                const asstKept = asstDiff && preferNewer && (t.asstUpdatedAt ?? 0) > (s.asstUpdatedAt ?? 0);
                 if (baseKept) plan.kept++;
                 if (asstKept && !baseKept) plan.kept++;
                 const syncBase = baseDiff && !baseKept;
-                const syncAsst = asstDiff && !asstKept;
                 if (!syncBase && !syncAsst) continue;
                 plan.chats.update.push({ id: s.id, targetId: t.id, charId: s.charId, name: s.name, base: syncBase, asst: syncAsst });
                 continue;
             }
+            if (t.digest === s.digest && t.name === s.name) continue;
             if (preferNewer && t.updatedAt > s.updatedAt) { plan.kept++; continue; }
             plan.chats.update.push({ id: s.id, targetId: t.id, charId: s.charId, name: s.name });
         }
@@ -163,7 +237,7 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             if (t.digest === s.digest) continue;
             if (s.baseDigest !== undefined && t.baseDigest !== undefined) {
                 const baseDiff = s.baseDigest !== t.baseDigest;
-                const extDiff = (s.extDigest || '') !== (t.extDigest || '');
+                const extDiff = (s.extDigest || '') !== (t.extDigest || '') && (mirror || Boolean(s.extDigest));
                 const baseKept = baseDiff && preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0);
                 const extKept = extDiff && preferNewer && (t.extUpdatedAt ?? t.updatedAt ?? 0) > (s.extUpdatedAt ?? s.updatedAt ?? 0);
                 if (baseKept) plan.kept++;
@@ -253,8 +327,21 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
 
         const srcSettings = source.settings || [];
         const tgtSettings = new Map((target.settings || []).map(s => [s.key, s]));
+        const installed = Array.isArray(target.installedExtensions) ? new Set(target.installedExtensions) : null;
         for (const s of srcSettings) {
             const t = tgtSettings.get(s.key);
+            if (s.key === 'enabledExtensions' && Array.isArray(s.extensions)) {
+                const validRemote = installed ? s.extensions.filter(id => installed.has(id)) : s.extensions;
+                const localList = Array.isArray(t?.extensions) ? t.extensions : [];
+                const merged = mirror
+                    ? [...new Set([...validRemote, ...(localList.includes('lan-sync') ? ['lan-sync'] : [])])]
+                    : [...new Set([...localList, ...validRemote])];
+                if (t && merged.length === localList.length && merged.every((id, i) => id === localList[i])) continue;
+                if (!t && merged.length === 0) continue;
+                plan.settings.put.push(s.key);
+                continue;
+            }
+            if (s.profileId && validProfileIds && !validProfileIds.has(s.profileId)) continue;
             if (!t) {
                 plan.settings.put.push(s.key);
                 continue;
