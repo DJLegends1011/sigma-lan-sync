@@ -41,10 +41,12 @@ export function isAllowedSettingKey(key, { includeConnections = false, includeSe
     if (!key || typeof key !== 'string') return false;
     // Never sync device-local / active-view state
     if (key === 'activeChatId' || key.startsWith('mobile') || key.startsWith('ext:lan-sync:')) return false;
-    // Extension settings: ext:<id>:* except ext:lan-sync:*
+    // Extension settings: ext:<id>:* except ext:lan-sync:* (check secrets on the subkey first)
     if (key.startsWith('ext:')) {
         const m = /^ext:([a-z0-9][a-z0-9-]{1,59}):(.+)$/.exec(key);
-        return Boolean(m && m[1] !== 'lan-sync');
+        if (!m || m[1] === 'lan-sync') return false;
+        if (SECRET_SETTINGS_RE.test(m[2])) return !!includeSecrets;
+        return true;
     }
     // Only with Connections on: chatProfileId, assistantProfileId, aiProfile.*
     if (key === 'chatProfileId' || key === 'assistantProfileId' || key.startsWith('aiProfile.')) {
@@ -499,7 +501,7 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
         }
     }
 
-    if (want.has('settings') || want.has('chats') || want.has('characters')) {
+    if (want.has('settings')) {
         try {
             const docs = db.prepare('SELECT key, value, updated_at FROM app_store ORDER BY key').all();
             for (const d of docs) {

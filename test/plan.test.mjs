@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makePlan, planCounts, alignSource } from '../server/plan.js';
+import { makePlan, alignSource, planCounts } from '../server/plan.js';
+import { isAllowedSettingKey } from '../server/manifest.js';
 import { buildPairLink, parsePairLink } from '../client/pair-link.js';
 
 const all = ['characters', 'chats', 'lorebooks', 'personas', 'presets', 'playlists'];
@@ -151,4 +152,40 @@ test('personas do not match by name when two personas share the same name on eit
     const plan = makePlan(source, target, { datasets: all, mode: 'incremental', overwrite: 'exact' });
     assert.equal(plan.personas.update.length, 0);
     assert.deepEqual(plan.personas.create, [{ id: 'p-src', name: 'Alex' }]);
+});
+
+test('isAllowedSettingKey gates ext:<id>:<secret> behind includeSecrets, app_store is gated on settings dataset only, and prefer-newer skips differing existing settings', () => {
+    assert.equal(isAllowedSettingKey('ext:evolutia:window', { includeSecrets: false }), true);
+    assert.equal(isAllowedSettingKey('ext:evolutia:apiKey', { includeSecrets: false }), false);
+    assert.equal(isAllowedSettingKey('ext:evolutia:apiKey', { includeSecrets: true }), true);
+    assert.equal(isAllowedSettingKey('ext:some-ext:accessToken', { includeSecrets: false }), false);
+    assert.equal(isAllowedSettingKey('ext:some-ext:password', { includeSecrets: false }), false);
+    assert.equal(isAllowedSettingKey('ext:some-ext:password', { includeSecrets: true }), true);
+
+    const source = {
+        characters: [], chats: [], worlds: [],
+        appStore: [{ key: 'assistant-prompts', digest: 'd-new', updatedAt: 20 }],
+        settings: [
+            { key: 'assistantSystemPrompt', digest: 's-new' },
+            { key: 'allowRichTagline', digest: 's-added' },
+        ],
+    };
+    const target = {
+        characters: [], chats: [], worlds: [],
+        appStore: [{ key: 'assistant-prompts', digest: 'd-old', updatedAt: 10 }],
+        settings: [
+            { key: 'assistantSystemPrompt', digest: 's-local-tweak' },
+        ],
+    };
+
+    // With settings dataset OFF (only chats + characters on), appStore is not planned
+    const withoutSettings = makePlan(source, target, { datasets: ['characters', 'chats'], mode: 'incremental', overwrite: 'exact' });
+    assert.deepEqual(withoutSettings.appStore.put, []);
+    assert.deepEqual(withoutSettings.settings.put, []);
+
+    // With settings dataset ON and prefer-newer, differing existing settings are kept while missing settings and newer appStore docs are put
+    const preferNewerPlan = makePlan(source, target, { datasets: ['settings'], mode: 'incremental', overwrite: 'prefer-newer' });
+    assert.deepEqual(preferNewerPlan.appStore.put, ['assistant-prompts']);
+    assert.deepEqual(preferNewerPlan.settings.put, ['allowRichTagline']);
+    assert.equal(preferNewerPlan.kept, 1);
 });

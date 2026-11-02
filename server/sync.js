@@ -35,6 +35,8 @@ export function createDbSnapshot(db, { includeConnections = false, includeSecret
     const schema = `snap_${Math.random().toString(36).slice(2, 10)}`;
     db.prepare(`ATTACH DATABASE ? AS ${schema}`).run(tmpFile);
     try {
+        // Zero deleted cells on delete so stripped secrets/profiles never linger in free pages
+        db.pragma(`${schema}.secure_delete = ON`);
         try { db.exec(`DELETE FROM ${schema}.change_log`); } catch { /* ignore */ }
         try { db.exec(`DELETE FROM ${schema}.changes`); } catch { /* ignore */ }
         if (!includeConnections) {
@@ -63,6 +65,17 @@ export function createDbSnapshot(db, { includeConnections = false, includeSecret
         }
     } finally {
         try { db.exec(`DETACH DATABASE ${schema}`); } catch { /* ignore */ }
+    }
+    // Belt and braces: open the detached snapshot and VACUUM it so the file is rebuilt without free pages
+    const Database = db.constructor;
+    if (typeof Database === 'function') {
+        const snapDb = new Database(tmpFile);
+        try {
+            snapDb.pragma('secure_delete = ON');
+            snapDb.exec('VACUUM');
+        } finally {
+            snapDb.close();
+        }
     }
     return tmpFile;
 }
@@ -870,7 +883,7 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
             }
 
             // ── 8c. app_store (Saved Prompts, greetings-expanded, promoted_namespaces) & allowlisted settings ──
-            if (want.has('settings') || want.has('chats') || want.has('characters')) {
+            if (want.has('settings')) {
                 const hasLocalStore = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'app_store'").get();
                 const hasRemoteStore = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'app_store'").get();
                 if (hasLocalStore && hasRemoteStore) {
@@ -885,11 +898,10 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                         upsertDoc.run(rdoc.key, rdoc.value, rdoc.updated_at ?? Date.now());
                     }
                 }
-            }
 
-            if (want.has('settings')) {
                 const includeConnections = want.has('connections');
                 const installedExts = installedExtensionIds();
+                const plannedSettings = new Set(plan.settings?.put || []);
                 const upsertSetting = db.prepare(`
                     INSERT INTO settings (key, value) VALUES (?, ?)
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -918,6 +930,7 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                         upsertSetting.run('enabledExtensions', JSON.stringify(merged));
                         continue;
                     }
+                    if (!plannedSettings.has(rset.key)) continue;
                     if (rset.key === 'chatProfileId' || rset.key === 'assistantProfileId' || rset.key.startsWith('aiProfile.')) {
                         let profId = rset.value;
                         try { profId = JSON.parse(rset.value); } catch { /* raw */ }

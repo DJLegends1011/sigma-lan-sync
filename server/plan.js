@@ -236,7 +236,7 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
         if (mirror) plan.backgrounds.delete = tgtList.filter(t => !matchedTargetIds.has(t.id)).map(t => t.id);
     }
 
-    if (want.has('settings') || want.has('chats') || want.has('characters')) {
+    if (want.has('settings')) {
         const srcDocs = source.appStore || [];
         const tgtDocs = new Map((target.appStore || []).map(d => [d.key, d]));
         for (const s of srcDocs) {
@@ -246,16 +246,22 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) { plan.kept++; continue; }
             plan.appStore.put.push(s.key);
         }
-    }
 
-    if (want.has('settings')) {
         const srcSettings = source.settings || [];
         const tgtSettings = new Map((target.settings || []).map(s => [s.key, s]));
         for (const s of srcSettings) {
             const t = tgtSettings.get(s.key);
-            if (!t || t.digest !== s.digest) {
+            if (!t) {
                 plan.settings.put.push(s.key);
+                continue;
             }
+            if (t.digest === s.digest) continue;
+            // The settings table has no per-key timestamp; in Prefer-newer mode keep existing local tweaks
+            if (preferNewer && s.key !== 'enabledExtensions') {
+                plan.kept++;
+                continue;
+            }
+            plan.settings.put.push(s.key);
         }
     }
 

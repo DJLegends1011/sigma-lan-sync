@@ -453,7 +453,7 @@ export function createPanel(ctx) {
                 ${toggle('syncPresets', 'Prompt presets (blocks and ordering)')}
                 ${toggle('syncPlaylists', 'Playlists (folders and character memberships)')}
                 ${toggle('syncBackgrounds', 'Backgrounds (chat wallpapers and bindings)')}
-                ${toggle('syncSettings', 'Settings & Saved Prompts (Assistant/Studio prompts, NSFW toggles, extension settings)')}
+                ${toggle('syncSettings', 'Settings & Saved Prompts (Assistant/Studio prompts, NSFW toggles, extension settings; overwritten in Exact, local kept in Prefer newer)')}
                 ${toggle('syncConnections', 'Connections (LLM profiles, active profile bindings and API keys — opt-in)', true)}
                 ${toggle('syncSecrets', 'Provider secrets (site tokens, passwords, emails and refresh tokens — opt-in)', true)}
             </div>

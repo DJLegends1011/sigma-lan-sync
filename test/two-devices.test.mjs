@@ -2,9 +2,14 @@
 // the desktop's link, the desktop approves the code both screens show), then synced both ways.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { fork } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import { resolveMediaFile } from '../server/sync.js';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolveMediaFile, createDbSnapshot } from '../server/sync.js';
+
+const sigmaDir = process.env.SIGMA_DIR || 'D:/ProjectSigma-main';
+const { default: Database } = await import(pathToFileURL(path.join(sigmaDir, 'node_modules', 'better-sqlite3', 'lib', 'index.js')).href);
 
 const deviceScript = fileURLToPath(new URL('./support/device.mjs', import.meta.url));
 
@@ -746,9 +751,10 @@ test('settings dataset syncs allowlist, filters enabledExtensions to installed (
         chatProfileId: sharedProfId,
         assistantProfileId: sharedProfId,
         'aiProfile.creator': sharedProfId,
-        // Secrets (opt-in is OFF by default)
+        // Secrets (opt-in is OFF by default), including an extension secret key
         chubToken: 'chub-secret-token-xyz',
         janitoraiPassword: 'janitor-secret-password',
+        'ext:evolutia:customApiKey': 'evo-secret-key-999',
         // Never-synced keys
         activeChatId: 'chat-only-on-phone',
         mobileSwipeGestures: false,
@@ -766,6 +772,7 @@ test('settings dataset syncs allowlist, filters enabledExtensions to installed (
         'aiProfile.creator': '',
         chubToken: null,
         janitoraiPassword: null,
+        'ext:evolutia:customApiKey': null,
     });
 
     // Dry-run Check should report missingExtensions
@@ -800,14 +807,24 @@ test('settings dataset syncs allowlist, filters enabledExtensions to installed (
     assert.equal(deskSettings.assistantProfileId, '', 'assistantProfileId did not sync while syncConnections is off');
     assert.equal(deskSettings['aiProfile.creator'] || '', '', 'aiProfile.creator did not sync while syncConnections is off');
 
-    // Secrets did NOT sync while syncSecrets is off
+    // Secrets did NOT sync while syncSecrets is off (including ext:<id>:<secret>)
     assert.equal(deskSettings.chubToken, null, 'chubToken did not sync while syncSecrets is off');
     assert.equal(deskSettings.janitoraiPassword, null, 'janitoraiPassword did not sync while syncSecrets is off');
+    assert.equal(deskSettings['ext:evolutia:customApiKey'] ?? null, null, 'ext:<id>:<secret> did not sync while syncSecrets is off');
 
     // Never-synced keys stayed untouched on desktop
     assert.equal(deskSettings.activeChatId, 'chat-on-desk', 'activeChatId never syncs');
     assert.equal(deskSettings.mobileSwipeGestures, true, 'mobile* never syncs');
     assert.equal(deskSettings['ext:lan-sync:deviceName'], 'Desktop Custom Name', 'ext:lan-sync:deviceName never syncs');
+
+    // Verify prefer-newer keeps local setting tweaks on desktop instead of overwriting them
+    await desk.api('/settings', 'PATCH', {
+        assistantSystemPrompt: 'Desktop local tweak to assistant prompt.',
+        'ext:lan-sync:overwrite': 'prefer-newer',
+    });
+    await pull(desk, phoneId);
+    assert.equal((await desk.api('/settings')).body.assistantSystemPrompt, 'Desktop local tweak to assistant prompt.', 'prefer-newer preserved local setting tweak');
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'exact' });
 
     // Now opt in to syncSecrets and syncConnections on desktop and verify both sync when opted in
     await desk.api('/settings', 'PATCH', { 'ext:lan-sync:syncSecrets': true, 'ext:lan-sync:syncConnections': true });
@@ -815,10 +832,43 @@ test('settings dataset syncs allowlist, filters enabledExtensions to installed (
     const deskSettingsWithSecrets = (await desk.api('/settings')).body;
     assert.equal(deskSettingsWithSecrets.chubToken, 'chub-secret-token-xyz', 'chubToken syncs when syncSecrets is on');
     assert.equal(deskSettingsWithSecrets.janitoraiPassword, 'janitor-secret-password', 'janitoraiPassword syncs when syncSecrets is on');
+    assert.equal(deskSettingsWithSecrets['ext:evolutia:customApiKey'], 'evo-secret-key-999', 'ext:<id>:<secret> syncs when syncSecrets is on');
     assert.equal(deskSettingsWithSecrets.chatProfileId, sharedProfId, 'chatProfileId syncs when syncConnections is on');
     assert.equal(deskSettingsWithSecrets.assistantProfileId, sharedProfId, 'assistantProfileId syncs when syncConnections is on');
     assert.equal(deskSettingsWithSecrets['aiProfile.creator'], sharedProfId, 'aiProfile.creator syncs when syncConnections is on');
     await desk.api('/settings', 'PATCH', { 'ext:lan-sync:syncSecrets': false, 'ext:lan-sync:syncConnections': false });
+});
+
+test('createDbSnapshot securely scrubs deleted secrets and llm_profiles bytes from the raw SQLite file when opt-ins are off', () => {
+    const memDb = new Database(':memory:');
+    try {
+        memDb.exec(`
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE llm_profiles (id TEXT PRIMARY KEY, name TEXT, api_key TEXT);
+            CREATE TABLE app_store (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);
+            CREATE TABLE change_log (id INTEGER PRIMARY KEY, summary TEXT);
+        `);
+        const secretToken = 'RAW_SNAPSHOT_SECRET_CHUB_TOKEN_987654321';
+        const secretExtKey = 'RAW_SNAPSHOT_EXT_API_KEY_123456789';
+        const secretLlmKey = 'RAW_SNAPSHOT_LLM_PROFILE_KEY_555555555';
+        memDb.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('chubToken', JSON.stringify(secretToken));
+        memDb.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('ext:evolutia:apiKey', JSON.stringify(secretExtKey));
+        memDb.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run('allowRichTagline', 'true');
+        memDb.prepare('INSERT INTO llm_profiles (id, name, api_key) VALUES (?, ?, ?)').run('p1', 'Secret Prof', secretLlmKey);
+
+        const snapPath = createDbSnapshot(memDb, { includeConnections: false, includeSecrets: false });
+        try {
+            const rawText = fs.readFileSync(snapPath).toString('latin1');
+            assert.ok(!rawText.includes(secretToken), 'raw snapshot bytes must not contain stripped chubToken');
+            assert.ok(!rawText.includes(secretExtKey), 'raw snapshot bytes must not contain stripped ext:<id>:apiKey');
+            assert.ok(!rawText.includes(secretLlmKey), 'raw snapshot bytes must not contain stripped llm_profiles api_key');
+            assert.ok(rawText.includes('allowRichTagline'), 'allowlisted setting remains in snapshot');
+        } finally {
+            try { fs.unlinkSync(snapPath); } catch { /* ignore */ }
+        }
+    } finally {
+        memDb.close();
+    }
 });
 
 test('a "Send to It" sync with no browser open on the receiver leaves x_evolutia_cards and Demetri\'s {{evolutia_persona}} placeholder correct', async () => {
