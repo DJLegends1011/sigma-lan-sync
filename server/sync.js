@@ -15,6 +15,7 @@ import {
     installedExtensionIds,
 } from './manifest.js';
 import { makePlan, planCounts, planSize, alignSource } from './plan.js';
+import { sha256 } from './crypto.js';
 
 const enc = encodeURIComponent;
 
@@ -480,33 +481,55 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                     }
                 }
 
-                // ── 2c. Card version history (versions & version_seq): insert-if-missing by (char_id, snap_id) ──
+                // ── 2c. Card version history (versions & version_seq): append-only by (char_id, created_at, sha256(data)) ──
                 const hasLocalVersions = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'versions'").get();
                 const hasRemoteVersions = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'versions'").get();
                 if (hasLocalVersions && hasRemoteVersions) {
                     const insVersion = db.prepare(`
-                        INSERT OR IGNORE INTO versions (char_id, snap_id, label, source, created_at, char_name, data)
-                        VALUES (@char_id, @snap_id, @label, @source, @created_at, @char_name, @data)
+                        INSERT INTO versions (char_id, snap_id, label, source, created_at, char_name, data)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                     `);
-                    const hasLocalVerSeq = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'version_seq'").get();
-                    const upsertVerSeq = hasLocalVerSeq
-                        ? db.prepare('INSERT INTO version_seq (char_id, last) VALUES (?, ?) ON CONFLICT(char_id) DO UPDATE SET last = MAX(version_seq.last, excluded.last)')
-                        : null;
-                    for (const rv of db.prepare('SELECT * FROM remote.versions').all()) {
+                    const insBackupIgnore = db.prepare(`
+                        INSERT OR IGNORE INTO versions (char_id, snap_id, label, source, created_at, char_name, data)
+                        VALUES (?, -1, ?, ?, ?, ?, ?)
+                    `);
+                    const hasLocalVerSeq = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'version_seq'").get();
+                    const nextLocalSnapId = (charId) => {
+                        const max = db.prepare("SELECT MAX(snap_id) AS m FROM versions WHERE char_id = ? AND snap_id >= 0 AND typeof(snap_id) = 'integer'").get(charId)?.m ?? 0;
+                        const last = hasLocalVerSeq
+                            ? (db.prepare('SELECT last FROM version_seq WHERE char_id = ?').get(charId)?.last ?? 0)
+                            : 0;
+                        const next = Math.max(max, last) + 1;
+                        if (hasLocalVerSeq) {
+                            db.prepare('INSERT INTO version_seq (char_id, last) VALUES (?, ?) ON CONFLICT(char_id) DO UPDATE SET last = excluded.last').run(charId, next);
+                        }
+                        return next;
+                    };
+                    const heldByChar = new Map();
+                    const heldKeysFor = (charId) => {
+                        let set = heldByChar.get(charId);
+                        if (!set) {
+                            set = new Set(
+                                db.prepare('SELECT snap_id, created_at, data FROM versions WHERE char_id = ? AND snap_id >= 0').all(charId)
+                                    .map(v => `${v.created_at ?? 0}:${sha256(String(v.data ?? ''))}`)
+                            );
+                            heldByChar.set(charId, set);
+                        }
+                        return set;
+                    };
+                    for (const rv of db.prepare('SELECT * FROM remote.versions ORDER BY created_at ASC, snap_id ASC').all()) {
                         const dstCharId = aliases[rv.char_id] || rv.char_id;
                         if (!db.prepare('SELECT 1 FROM characters WHERE id = ?').get(dstCharId)) continue;
-                        insVersion.run({ ...rv, char_id: dstCharId });
-                        if (upsertVerSeq && Number.isInteger(rv.snap_id) && rv.snap_id > 0) {
-                            upsertVerSeq.run(dstCharId, rv.snap_id);
+                        if (rv.snap_id === -1) {
+                            insBackupIgnore.run(dstCharId, rv.label, rv.source, rv.created_at, rv.char_name, rv.data);
+                            continue;
                         }
-                    }
-                    const hasRemoteVerSeq = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'version_seq'").get();
-                    if (upsertVerSeq && hasRemoteVerSeq) {
-                        for (const rvs of db.prepare('SELECT char_id, last FROM remote.version_seq').all()) {
-                            const dstCharId = aliases[rvs.char_id] || rvs.char_id;
-                            if (!db.prepare('SELECT 1 FROM characters WHERE id = ?').get(dstCharId)) continue;
-                            upsertVerSeq.run(dstCharId, rvs.last);
-                        }
+                        const vKey = `${rv.created_at ?? 0}:${sha256(String(rv.data ?? ''))}`;
+                        const held = heldKeysFor(dstCharId);
+                        if (held.has(vKey)) continue;
+                        held.add(vKey);
+                        const newSnapId = nextLocalSnapId(dstCharId);
+                        insVersion.run(dstCharId, newSnapId, rv.label, rv.source, rv.created_at, rv.char_name, rv.data);
                     }
                 }
 
@@ -1151,20 +1174,39 @@ export function mergeDuplicateCharacter(db, paths, store, { fromId, intoId, peer
             db.prepare('UPDATE OR IGNORE background_bindings SET char_id = ? WHERE char_id = ?').run(intoId, fromId);
             db.prepare('DELETE FROM background_bindings WHERE char_id = ?').run(fromId);
 
-            // Move char_aliases and versions onto intoId before deleteCharacters removes fromId
+            // Move char_aliases and versions (by content identity with new local snap_ids) onto intoId before deleteCharacters removes fromId
             try {
                 for (const ra of db.prepare('SELECT kind, value FROM char_aliases WHERE char_id = ?').all(fromId)) {
                     db.prepare('INSERT OR IGNORE INTO char_aliases (kind, value, char_id) VALUES (?, ?, ?)').run(ra.kind, ra.value, intoId);
                 }
             } catch { /* ignore */ }
             try {
-                for (const rv of db.prepare('SELECT * FROM versions WHERE char_id = ?').all(fromId)) {
-                    db.prepare('INSERT OR IGNORE INTO versions (char_id, snap_id, label, source, created_at, char_name, data) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                        .run(intoId, rv.snap_id, rv.label, rv.source, rv.created_at, rv.char_name, rv.data);
-                }
-                const maxSnap = db.prepare("SELECT MAX(snap_id) AS m FROM versions WHERE char_id = ? AND snap_id >= 0 AND typeof(snap_id) = 'integer'").get(intoId)?.m ?? 0;
-                if (maxSnap > 0) {
-                    db.prepare('INSERT INTO version_seq (char_id, last) VALUES (?, ?) ON CONFLICT(char_id) DO UPDATE SET last = MAX(version_seq.last, excluded.last)').run(intoId, maxSnap);
+                const held = new Set(
+                    db.prepare('SELECT created_at, data FROM versions WHERE char_id = ? AND snap_id >= 0').all(intoId)
+                        .map(v => `${v.created_at ?? 0}:${sha256(String(v.data ?? ''))}`)
+                );
+                const hasVerSeq = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'version_seq'").get();
+                const nextSnapForInto = () => {
+                    const max = db.prepare("SELECT MAX(snap_id) AS m FROM versions WHERE char_id = ? AND snap_id >= 0 AND typeof(snap_id) = 'integer'").get(intoId)?.m ?? 0;
+                    const last = hasVerSeq ? (db.prepare('SELECT last FROM version_seq WHERE char_id = ?').get(intoId)?.last ?? 0) : 0;
+                    const next = Math.max(max, last) + 1;
+                    if (hasVerSeq) {
+                        db.prepare('INSERT INTO version_seq (char_id, last) VALUES (?, ?) ON CONFLICT(char_id) DO UPDATE SET last = excluded.last').run(intoId, next);
+                    }
+                    return next;
+                };
+                for (const rv of db.prepare('SELECT * FROM versions WHERE char_id = ? ORDER BY created_at ASC, snap_id ASC').all(fromId)) {
+                    if (rv.snap_id === -1) {
+                        db.prepare('INSERT OR IGNORE INTO versions (char_id, snap_id, label, source, created_at, char_name, data) VALUES (?, -1, ?, ?, ?, ?, ?)')
+                            .run(intoId, rv.label, rv.source, rv.created_at, rv.char_name, rv.data);
+                        continue;
+                    }
+                    const vKey = `${rv.created_at ?? 0}:${sha256(String(rv.data ?? ''))}`;
+                    if (held.has(vKey)) continue;
+                    held.add(vKey);
+                    const newSnapId = nextSnapForInto();
+                    db.prepare('INSERT INTO versions (char_id, snap_id, label, source, created_at, char_name, data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                        .run(intoId, newSnapId, rv.label, rv.source, rv.created_at, rv.char_name, rv.data);
                 }
             } catch { /* ignore */ }
 

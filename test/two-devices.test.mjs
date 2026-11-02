@@ -944,7 +944,7 @@ test('a "Send to It" sync with no browser open on the receiver leaves x_evolutia
     await phone.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'exact' });
 });
 
-test('versions (card version history) syncs with Characters using insert-if-missing by (char_id, snap_id) and maps char_id through aliases', async () => {
+test('versions (card version history) merges by content identity (created_at, sha256(data)) with new local snap_ids across both devices and in mergeDuplicateCharacter', async () => {
     const deskVannessa = (await desk.api('/characters?q=Vannessa')).body.items.find(c => c.name === 'Vannessa');
     const phoneVannessa = (await phone.api('/characters?q=Vannessa')).body.items.find(c => c.name === 'Vannessa');
     assert.ok(deskVannessa && phoneVannessa);
@@ -953,38 +953,73 @@ test('versions (card version history) syncs with Characters using insert-if-miss
     await desk.api(`/versions/char/${deskVannessa.id}`, 'DELETE');
     await phone.api(`/versions/char/${phoneVannessa.id}`, 'DELETE');
 
-    // Add snap 1 on desktop
-    const sDesk1 = await desk.api(`/versions/char/${deskVannessa.id}/snapshots`, 'POST', {
-        label: 'Desk Snap 1',
-        source: 'local',
-        charName: 'Vannessa',
-        data: { name: 'Vannessa', description: 'Desk v1' },
-    });
-    assert.equal(sDesk1.status, 200);
+    // Both devices save 2 different versions of the same card (so both devices allocate snap_id 1 and 2 locally!)
+    for (const [label, desc] of [['Desk Snap A', 'Desk v1'], ['Desk Snap B', 'Desk v2']]) {
+        const res = await desk.api(`/versions/char/${deskVannessa.id}/snapshots`, 'POST', {
+            label,
+            source: 'local',
+            charName: 'Vannessa',
+            data: { name: 'Vannessa', description: desc },
+        });
+        assert.equal(res.status, 200);
+        await sleep(5);
+    }
+    for (const [label, desc] of [['Phone Snap C', 'Phone v1'], ['Phone Snap D', 'Phone v2']]) {
+        const res = await phone.api(`/versions/char/${phoneVannessa.id}/snapshots`, 'POST', {
+            label,
+            source: 'local',
+            charName: 'Vannessa',
+            data: { name: 'Vannessa', description: desc },
+        });
+        assert.equal(res.status, 200);
+        await sleep(5);
+    }
 
-    // Add snap 1 and snap 2 on phone (where Vannessa has a different char_id mapped via aliases)
-    const sPhone1 = await phone.api(`/versions/char/${phoneVannessa.id}/snapshots`, 'POST', {
-        label: 'Phone Snap 1',
-        source: 'local',
-        charName: 'Vannessa',
-        data: { name: 'Vannessa', description: 'Phone v1' },
-    });
-    assert.equal(sPhone1.status, 200);
-    const sPhone2 = await phone.api(`/versions/char/${phoneVannessa.id}/snapshots`, 'POST', {
-        label: 'Phone Snap 2',
-        source: 'local',
-        charName: 'Vannessa',
-        data: { name: 'Vannessa', description: 'Phone v2' },
-    });
-    assert.equal(sPhone2.status, 200);
+    // Check on desktop sees that phone has versions desktop lacks, even though both have snap_ids 1 and 2
+    const dryBefore = await dryRun(desk, phoneId);
+    assert.equal(dryBefore.charactersChanged, 1, 'Check detects differing version contents despite identical snap_id numbers');
 
+    // Sync both ways: desk pulls from phone, then phone pulls from desk
     await pull(desk, phoneId);
+    await pull(phone, deskId);
 
-    const deskVers = (await desk.api(`/versions/char/${deskVannessa.id}`)).body;
-    assert.equal(deskVers.snapshots.length, 2);
-    // snap 1 kept Desktop's copy (insert-if-missing), snap 2 arrived from Phone mapped to deskVannessa.id
-    assert.equal(deskVers.snapshots[0].label, 'Desk Snap 1');
-    assert.equal(deskVers.snapshots[1].label, 'Phone Snap 2');
+    const deskVers = (await desk.api(`/versions/char/${deskVannessa.id}`)).body.snapshots;
+    const phoneVers = (await phone.api(`/versions/char/${phoneVannessa.id}`)).body.snapshots;
+    assert.equal(deskVers.length, 4, 'desktop has all 4 versions');
+    assert.equal(phoneVers.length, 4, 'phone has all 4 versions');
+    assert.deepEqual(deskVers.map(s => s.label).sort(), ['Desk Snap A', 'Desk Snap B', 'Phone Snap C', 'Phone Snap D']);
+    assert.deepEqual(phoneVers.map(s => s.label).sort(), ['Desk Snap A', 'Desk Snap B', 'Phone Snap C', 'Phone Snap D']);
+    assert.equal(new Set(deskVers.map(s => s.id)).size, 4, 'desktop snap_ids are unique');
+    assert.equal(new Set(phoneVers.map(s => s.id)).size, 4, 'phone snap_ids are unique');
+
+    // Syncing again changes nothing
+    assert.deepEqual(nothingToDo(await dryRun(desk, phoneId)), []);
+    assert.deepEqual(nothingToDo(await dryRun(phone, deskId)), []);
+
+    // Merging a duplicate whose versions share snap numbers (1, 2) with the original keeps all of them
+    const origChar = await desk.call('importCard', { name: 'VerMerge', description: 'Orig', first_mes: 'Hi' });
+    const copyChar = await desk.call('importCard', { name: 'VerMerge', description: 'Copy', first_mes: 'Hi' });
+    // Clear any initial import snapshots so we control snap 1 and 2 on each
+    await desk.api(`/versions/char/${origChar.id}`, 'DELETE');
+    await desk.api(`/versions/char/${copyChar.id}`, 'DELETE');
+
+    await desk.api(`/versions/char/${origChar.id}/snapshots`, 'POST', { label: 'Orig 1', data: { description: 'O1' } });
+    await sleep(5);
+    await desk.api(`/versions/char/${origChar.id}/snapshots`, 'POST', { label: 'Orig 2', data: { description: 'O2' } });
+    await sleep(5);
+    await desk.api(`/versions/char/${copyChar.id}/snapshots`, 'POST', { label: 'Copy 1', data: { description: 'C1' } });
+    await sleep(5);
+    await desk.api(`/versions/char/${copyChar.id}/snapshots`, 'POST', { label: 'Copy 2', data: { description: 'C2' } });
+
+    const mergeRes = await desk.ext('/characters/merge', 'POST', { fromId: copyChar.id, intoId: origChar.id });
+    assert.equal(mergeRes.status, 200);
+    const mergedVers = (await desk.api(`/versions/char/${origChar.id}`)).body.snapshots;
+    assert.equal(mergedVers.length, 4, 'all 4 versions preserved when merging duplicate with colliding snap_ids');
+    assert.deepEqual(mergedVers.map(s => s.label), ['Orig 1', 'Orig 2', 'Copy 1', 'Copy 2']);
+    assert.deepEqual(mergedVers.map(s => s.id), [1, 2, 3, 4]);
+
+    // Sync to phone so the following test starts with both devices in step
+    await pull(phone, deskId);
 });
 
 test('world_sources (lorebook import links) syncs with Lorebooks keyed by world_name', async () => {

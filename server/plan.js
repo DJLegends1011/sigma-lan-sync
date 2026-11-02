@@ -45,8 +45,8 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             const meta = s.meta !== t.meta;
             const media = s.mediaSig ? s.mediaSig !== t.mediaSig : s.mediaCount > t.mediaCount;
             const studio = (s.studioDigest || '') !== (t.studioDigest || '');
-            const tgtSnaps = new Set(t.versionSnaps || []);
-            const versions = Array.isArray(s.versionSnaps) && s.versionSnaps.some(snapId => !tgtSnaps.has(snapId));
+            const tgtVerKeys = new Set(t.versionKeys || []);
+            const versions = Array.isArray(s.versionKeys) && s.versionKeys.some(k => !tgtVerKeys.has(k));
             if (!card && !meta && !media && !studio && !versions) continue;
             const cardMetaKept = (card || meta) && preferNewer && t.updatedAt > s.updatedAt;
             const studioKept = studio && preferNewer && (t.studioUpdatedAt ?? 0) > (s.studioUpdatedAt ?? 0);
