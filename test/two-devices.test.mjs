@@ -943,3 +943,107 @@ test('a "Send to It" sync with no browser open on the receiver leaves x_evolutia
     await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'exact' });
     await phone.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'exact' });
 });
+
+test('versions (card version history) syncs with Characters using insert-if-missing by (char_id, snap_id) and maps char_id through aliases', async () => {
+    const deskVannessa = (await desk.api('/characters?q=Vannessa')).body.items.find(c => c.name === 'Vannessa');
+    const phoneVannessa = (await phone.api('/characters?q=Vannessa')).body.items.find(c => c.name === 'Vannessa');
+    assert.ok(deskVannessa && phoneVannessa);
+
+    // Clear any existing versions on both devices first
+    await desk.api(`/versions/char/${deskVannessa.id}`, 'DELETE');
+    await phone.api(`/versions/char/${phoneVannessa.id}`, 'DELETE');
+
+    // Add snap 1 on desktop
+    const sDesk1 = await desk.api(`/versions/char/${deskVannessa.id}/snapshots`, 'POST', {
+        label: 'Desk Snap 1',
+        source: 'local',
+        charName: 'Vannessa',
+        data: { name: 'Vannessa', description: 'Desk v1' },
+    });
+    assert.equal(sDesk1.status, 200);
+
+    // Add snap 1 and snap 2 on phone (where Vannessa has a different char_id mapped via aliases)
+    const sPhone1 = await phone.api(`/versions/char/${phoneVannessa.id}/snapshots`, 'POST', {
+        label: 'Phone Snap 1',
+        source: 'local',
+        charName: 'Vannessa',
+        data: { name: 'Vannessa', description: 'Phone v1' },
+    });
+    assert.equal(sPhone1.status, 200);
+    const sPhone2 = await phone.api(`/versions/char/${phoneVannessa.id}/snapshots`, 'POST', {
+        label: 'Phone Snap 2',
+        source: 'local',
+        charName: 'Vannessa',
+        data: { name: 'Vannessa', description: 'Phone v2' },
+    });
+    assert.equal(sPhone2.status, 200);
+
+    await pull(desk, phoneId);
+
+    const deskVers = (await desk.api(`/versions/char/${deskVannessa.id}`)).body;
+    assert.equal(deskVers.snapshots.length, 2);
+    // snap 1 kept Desktop's copy (insert-if-missing), snap 2 arrived from Phone mapped to deskVannessa.id
+    assert.equal(deskVers.snapshots[0].label, 'Desk Snap 1');
+    assert.equal(deskVers.snapshots[1].label, 'Phone Snap 2');
+});
+
+test('world_sources (lorebook import links) syncs with Lorebooks keyed by world_name', async () => {
+    const linkRes = await phone.api(`/worlds/${encodeURIComponent('Nova Lore')}/source`, 'PUT', {
+        provider: 'chub',
+        externalId: 'lore-nova-777',
+        path: 'scifi/lore-nova-777',
+        url: 'https://chub.ai/lorebooks/scifi/lore-nova-777',
+    });
+    assert.equal(linkRes.status, 200);
+
+    // Check shows lorebook changed when world_sources is added
+    const dry = await dryRun(desk, phoneId);
+    assert.equal(dry.lorebooksChanged, 1);
+
+    await pull(desk, phoneId);
+
+    const probe = await desk.api('/worlds/probe', 'POST', {
+        provider: 'chub',
+        keys: ['lore-nova-777', 'missing-key'],
+    });
+    assert.equal(probe.status, 200);
+    assert.deepEqual(probe.body.found, ['lore-nova-777']);
+});
+
+test('char_aliases feeds into twin matching and syncs with Characters (mapping char_id through aliases)', async () => {
+    // Import a card on desktop and phone with the same version_uid alias in extensions, but empty creator/createDate and different descriptions
+    const onDesk = await desk.call('importCard', {
+        name: 'AliasTwin',
+        description: 'Desktop original description',
+        first_mes: 'Hi from desk',
+        extensions: { version_uid: 'vuid-twin-001' },
+    });
+    const onPhone = await phone.call('importCard', {
+        name: 'AliasTwin',
+        description: 'Phone updated description',
+        first_mes: 'Hi from phone',
+        extensions: { version_uid: 'vuid-twin-001' },
+    });
+    assert.notEqual(onDesk.id, onPhone.id);
+
+    // Also import a phone-only character that carries its own version_uid alias so we can verify char_aliases rows sync to desktop
+    const phoneOnly = await phone.call('importCard', {
+        name: 'AliasCarrier',
+        description: 'Carries version_uid-002',
+        first_mes: 'Hello',
+        extensions: { version_uid: 'vuid-carrier-002' },
+    });
+
+    await pull(desk, phoneId);
+
+    // 1. AliasTwin was paired via char_aliases (version_uid:vuid-twin-001) despite empty creator/createDate and different digest
+    const twinsOnDesk = (await desk.api('/characters?q=AliasTwin')).body.items.filter(c => c.name === 'AliasTwin');
+    assert.deepEqual(twinsOnDesk.map(c => c.id), [onDesk.id], 'paired as one character via char_aliases');
+    const twinDetail = (await desk.api(`/characters/${onDesk.id}`)).body;
+    assert.equal(twinDetail.card.data.description, 'Phone updated description');
+
+    // 2. AliasCarrier's char_aliases row synced to desktop (manifest meta digest includes char_aliases, so dryRun sees 0 differences)
+    const deskCarrier = (await desk.api(`/characters/${phoneOnly.id}`)).body;
+    assert.equal(deskCarrier.card.data.name, 'AliasCarrier');
+    assert.deepEqual(nothingToDo(await dryRun(desk, phoneId)), []);
+});

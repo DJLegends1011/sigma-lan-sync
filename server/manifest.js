@@ -250,6 +250,14 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
         const tagRows = db.prepare('SELECT ct.char_id, t.name FROM char_tags ct JOIN tags t ON t.id = ct.tag_id ORDER BY ct.char_id, t.name COLLATE NOCASE').all();
         const worldRows = db.prepare('SELECT char_id, world_name FROM char_worlds ORDER BY char_id, pos').all();
         const linkRows = db.prepare('SELECT char_id, provider_id, external_id, full_path FROM provider_links ORDER BY char_id, provider_id').all();
+        let aliasRows = [];
+        try {
+            aliasRows = db.prepare('SELECT char_id, kind, value FROM char_aliases ORDER BY char_id, kind, value').all();
+        } catch { /* ignore if table absent */ }
+        let versionRows = [];
+        try {
+            versionRows = db.prepare('SELECT char_id, snap_id, label, source, created_at FROM versions ORDER BY char_id, snap_id').all();
+        } catch { /* ignore if table absent */ }
         const mediaRows = db.prepare("SELECT char_id, COUNT(*) AS n, GROUP_CONCAT(COALESCE(content_hash, file || ':' || COALESCE(size, 0)), '|') AS sig FROM (SELECT char_id, content_hash, file, size FROM media ORDER BY char_id, display_name) GROUP BY char_id").all();
         let studioRows = [];
         try {
@@ -272,6 +280,17 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
             if (!r.provider_id || (!r.external_id && !r.full_path)) continue;
             if (!linksByChar.has(r.char_id)) linksByChar.set(r.char_id, []);
             linksByChar.get(r.char_id).push(key);
+        }
+        const aliasesByChar = new Map();
+        for (const r of aliasRows) {
+            if (!r.kind || !r.value) continue;
+            if (!aliasesByChar.has(r.char_id)) aliasesByChar.set(r.char_id, []);
+            aliasesByChar.get(r.char_id).push(`${r.kind}:${r.value}`);
+        }
+        const versionsByChar = new Map();
+        for (const r of versionRows) {
+            if (!versionsByChar.has(r.char_id)) versionsByChar.set(r.char_id, []);
+            versionsByChar.get(r.char_id).push(r);
         }
         const mediaByChar = new Map(mediaRows.map(r => [r.char_id, { count: r.n, sig: r.sig || '' }]));
         const studioByChar = new Map();
@@ -302,6 +321,9 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
             const studioUpdatedAt = stList.length
                 ? Math.max(0, ...stList.map(s => Number(s.updated_at) || 0))
                 : 0;
+            const vList = versionsByChar.get(c.id) || [];
+            const versionSnaps = vList.map(v => v.snap_id);
+            const charAliases = aliasesByChar.get(c.id) || [];
             let creator = '';
             let createDate = '';
             try {
@@ -315,9 +337,11 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
                 creator,
                 createDate,
                 providerLinks: linksByChar.get(c.id) || [],
+                charAliases,
                 updatedAt: c.updated_at ?? 0,
                 studioUpdatedAt,
                 studioDigest,
+                versionSnaps,
                 mediaCount: m.count,
                 mediaSig: sha256(m.sig),
                 card: sha256(`${c.content_hash || sha256(c.card)}|${av.avatar}`),
@@ -326,6 +350,7 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
                     fav: !!c.fav,
                     updateLocked: !!c.update_locked,
                     worlds: worldsByChar.get(c.id) || [],
+                    aliases: charAliases,
                 })),
             });
         }
@@ -386,12 +411,19 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS, inc
     if (want.has('lorebooks')) {
         const worlds = db.prepare('SELECT name, data, updated_at, placeholder FROM worlds WHERE placeholder = 0 ORDER BY name COLLATE NOCASE').all();
         const entryStmt = db.prepare('SELECT uid, data FROM world_entries WHERE world_name = ? ORDER BY uid');
+        let wsRows = [];
+        try {
+            wsRows = db.prepare('SELECT world_name, provider, external_id, path, url, linked_at FROM world_sources').all();
+        } catch { /* ignore if table absent */ }
+        const wsByWorld = new Map(wsRows.map(r => [r.world_name, r]));
         for (const w of worlds) {
             const entries = entryStmt.all(w.name);
+            const ws = wsByWorld.get(w.name);
+            const wsPart = ws ? `|${ws.provider}:${ws.external_id}:${ws.path || ''}:${ws.url || ''}:${ws.linked_at || 0}` : '';
             manifest.worlds.push({
                 name: w.name,
                 updatedAt: w.updated_at ?? 0,
-                digest: sha256(`${w.data}|${entries.map(e => `${e.uid}:${e.data}`).join('\n')}`),
+                digest: sha256(`${w.data}|${entries.map(e => `${e.uid}:${e.data}`).join('\n')}${wsPart}`),
             });
         }
     }

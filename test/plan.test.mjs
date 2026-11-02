@@ -135,6 +135,10 @@ test('alignSource does not pair unrelated cards that only share a name when crea
     const source3 = { characters: [char('s1', { name: 'Alice', card: 'c1', providerLinks: ['chub:123'] })], chats: [], worlds: [] };
     const target3 = { characters: [char('t1', { name: 'Alice', card: 'c2', providerLinks: ['chub:123'] })], chats: [], worlds: [] };
     assert.deepEqual(alignSource(source3, target3, {}).aliases, { s1: 't1' }, 'unique providerLink pairs');
+
+    const source4 = { characters: [char('s1', { name: 'Alice', card: 'c1', charAliases: ['version_uid:uid-42'] })], chats: [], worlds: [] };
+    const target4 = { characters: [char('t1', { name: 'AliceRenamed', card: 'c2', charAliases: ['version_uid:uid-42'] })], chats: [], worlds: [] };
+    assert.deepEqual(alignSource(source4, target4, {}).aliases, { s1: 't1' }, 'unique charAliases pairs even when name and digest differ');
 });
 
 test('personas do not match by name when two personas share the same name on either side', () => {

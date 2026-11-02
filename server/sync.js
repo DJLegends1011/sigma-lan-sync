@@ -297,6 +297,7 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                 }
                 if (mirror) {
                     for (const name of plan.worlds.delete) {
+                        try { db.prepare('DELETE FROM world_sources WHERE world_name = ?').run(name); } catch { /* ignore */ }
                         db.prepare('DELETE FROM world_entries WHERE world_name = ?').run(name);
                         db.prepare('DELETE FROM global_worlds WHERE world_name = ?').run(name);
                         db.prepare('DELETE FROM char_worlds WHERE world_name = ?').run(name);
@@ -311,6 +312,27 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                     const exists = db.prepare('SELECT 1 FROM worlds WHERE name = ?').get(gw.world_name);
                     if (exists) {
                         db.prepare('INSERT OR IGNORE INTO global_worlds (world_name, pos) VALUES (?, ?)').run(gw.world_name, gw.pos);
+                    }
+                }
+                // ── 1b. Lorebook import links (world_sources), keyed by world_name ──
+                const hasLocalWs = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'world_sources'").get();
+                const hasRemoteWs = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'world_sources'").get();
+                if (hasLocalWs && hasRemoteWs) {
+                    const upsertWs = db.prepare(upsertSql('world_sources', ['world_name']));
+                    const seenWsWorlds = new Set();
+                    for (const rws of db.prepare('SELECT * FROM remote.world_sources').all()) {
+                        if (!db.prepare('SELECT 1 FROM worlds WHERE name = ?').get(rws.world_name)) continue;
+                        seenWsWorlds.add(rws.world_name);
+                        const locWs = db.prepare('SELECT linked_at FROM world_sources WHERE world_name = ?').get(rws.world_name);
+                        if (locWs && preferNewer && (locWs.linked_at ?? 0) > (rws.linked_at ?? 0)) continue;
+                        upsertWs.run(rws);
+                    }
+                    if (mirror) {
+                        for (const lws of db.prepare('SELECT world_name FROM world_sources').all()) {
+                            if (!seenWsWorlds.has(lws.world_name)) {
+                                db.prepare('DELETE FROM world_sources WHERE world_name = ?').run(lws.world_name);
+                            }
+                        }
                     }
                 }
             }
@@ -399,9 +421,11 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                         db.prepare('DELETE FROM char_tags WHERE char_id = ?').run(delId);
                         db.prepare('DELETE FROM char_worlds WHERE char_id = ?').run(delId);
                         db.prepare('DELETE FROM provider_links WHERE char_id = ?').run(delId);
+                        try { db.prepare('DELETE FROM char_aliases WHERE char_id = ?').run(delId); } catch { /* ignore */ }
                         db.prepare('DELETE FROM media WHERE char_id = ?').run(delId);
                         db.prepare('DELETE FROM playlist_chars WHERE char_id = ?').run(delId);
                         try { db.prepare('DELETE FROM versions WHERE char_id = ?').run(delId); } catch { /* ignore */ }
+                        try { db.prepare('DELETE FROM version_seq WHERE char_id = ?').run(delId); } catch { /* ignore */ }
                         const delChats = db.prepare('SELECT id FROM chats WHERE char_id = ?').all(delId);
                         for (const dc of delChats) {
                             db.prepare('DELETE FROM chat_messages WHERE chat_id = ?').run(dc.id);
@@ -451,6 +475,67 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                                 }
                                 db.prepare('DELETE FROM attachments WHERE studio_id = ?').run(lss.id);
                                 db.prepare('DELETE FROM studio_sessions WHERE id = ?').run(lss.id);
+                            }
+                        }
+                    }
+                }
+
+                // ── 2c. Card version history (versions & version_seq): insert-if-missing by (char_id, snap_id) ──
+                const hasLocalVersions = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'versions'").get();
+                const hasRemoteVersions = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'versions'").get();
+                if (hasLocalVersions && hasRemoteVersions) {
+                    const insVersion = db.prepare(`
+                        INSERT OR IGNORE INTO versions (char_id, snap_id, label, source, created_at, char_name, data)
+                        VALUES (@char_id, @snap_id, @label, @source, @created_at, @char_name, @data)
+                    `);
+                    const hasLocalVerSeq = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'version_seq'").get();
+                    const upsertVerSeq = hasLocalVerSeq
+                        ? db.prepare('INSERT INTO version_seq (char_id, last) VALUES (?, ?) ON CONFLICT(char_id) DO UPDATE SET last = MAX(version_seq.last, excluded.last)')
+                        : null;
+                    for (const rv of db.prepare('SELECT * FROM remote.versions').all()) {
+                        const dstCharId = aliases[rv.char_id] || rv.char_id;
+                        if (!db.prepare('SELECT 1 FROM characters WHERE id = ?').get(dstCharId)) continue;
+                        insVersion.run({ ...rv, char_id: dstCharId });
+                        if (upsertVerSeq && Number.isInteger(rv.snap_id) && rv.snap_id > 0) {
+                            upsertVerSeq.run(dstCharId, rv.snap_id);
+                        }
+                    }
+                    const hasRemoteVerSeq = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'version_seq'").get();
+                    if (upsertVerSeq && hasRemoteVerSeq) {
+                        for (const rvs of db.prepare('SELECT char_id, last FROM remote.version_seq').all()) {
+                            const dstCharId = aliases[rvs.char_id] || rvs.char_id;
+                            if (!db.prepare('SELECT 1 FROM characters WHERE id = ?').get(dstCharId)) continue;
+                            upsertVerSeq.run(dstCharId, rvs.last);
+                        }
+                    }
+                }
+
+                // ── 2d. Character identity aliases (char_aliases) with Characters ──
+                const hasLocalAliases = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'char_aliases'").get();
+                const hasRemoteAliases = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'char_aliases'").get();
+                if (hasLocalAliases && hasRemoteAliases) {
+                    const upsertAlias = db.prepare(`
+                        INSERT INTO char_aliases (kind, value, char_id) VALUES (?, ?, ?)
+                        ON CONFLICT(kind, value) DO UPDATE SET char_id = excluded.char_id
+                    `);
+                    const insertIgnoreAlias = db.prepare(`
+                        INSERT OR IGNORE INTO char_aliases (kind, value, char_id) VALUES (?, ?, ?)
+                    `);
+                    const seenAliasKeys = new Set();
+                    for (const ra of db.prepare('SELECT kind, value, char_id FROM remote.char_aliases').all()) {
+                        const dstCharId = aliases[ra.char_id] || ra.char_id;
+                        if (!db.prepare('SELECT 1 FROM characters WHERE id = ?').get(dstCharId)) continue;
+                        seenAliasKeys.add(`${ra.kind}\u0000${ra.value}`);
+                        if (preferNewer) {
+                            insertIgnoreAlias.run(ra.kind, ra.value, dstCharId);
+                        } else {
+                            upsertAlias.run(ra.kind, ra.value, dstCharId);
+                        }
+                    }
+                    if (mirror) {
+                        for (const la of db.prepare('SELECT kind, value FROM char_aliases').all()) {
+                            if (!seenAliasKeys.has(`${la.kind}\u0000${la.value}`)) {
+                                db.prepare('DELETE FROM char_aliases WHERE kind = ? AND value = ?').run(la.kind, la.value);
                             }
                         }
                     }
@@ -1065,6 +1150,23 @@ export function mergeDuplicateCharacter(db, paths, store, { fromId, intoId, peer
 
             db.prepare('UPDATE OR IGNORE background_bindings SET char_id = ? WHERE char_id = ?').run(intoId, fromId);
             db.prepare('DELETE FROM background_bindings WHERE char_id = ?').run(fromId);
+
+            // Move char_aliases and versions onto intoId before deleteCharacters removes fromId
+            try {
+                for (const ra of db.prepare('SELECT kind, value FROM char_aliases WHERE char_id = ?').all(fromId)) {
+                    db.prepare('INSERT OR IGNORE INTO char_aliases (kind, value, char_id) VALUES (?, ?, ?)').run(ra.kind, ra.value, intoId);
+                }
+            } catch { /* ignore */ }
+            try {
+                for (const rv of db.prepare('SELECT * FROM versions WHERE char_id = ?').all(fromId)) {
+                    db.prepare('INSERT OR IGNORE INTO versions (char_id, snap_id, label, source, created_at, char_name, data) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                        .run(intoId, rv.snap_id, rv.label, rv.source, rv.created_at, rv.char_name, rv.data);
+                }
+                const maxSnap = db.prepare("SELECT MAX(snap_id) AS m FROM versions WHERE char_id = ? AND snap_id >= 0 AND typeof(snap_id) = 'integer'").get(intoId)?.m ?? 0;
+                if (maxSnap > 0) {
+                    db.prepare('INSERT INTO version_seq (char_id, last) VALUES (?, ?) ON CONFLICT(char_id) DO UPDATE SET last = MAX(version_seq.last, excluded.last)').run(intoId, maxSnap);
+                }
+            } catch { /* ignore */ }
 
             // 4. Move any extension x_* tables with a char_id column
             const extTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'x_%'").pluck().all();

@@ -45,7 +45,9 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             const meta = s.meta !== t.meta;
             const media = s.mediaSig ? s.mediaSig !== t.mediaSig : s.mediaCount > t.mediaCount;
             const studio = (s.studioDigest || '') !== (t.studioDigest || '');
-            if (!card && !meta && !media && !studio) continue;
+            const tgtSnaps = new Set(t.versionSnaps || []);
+            const versions = Array.isArray(s.versionSnaps) && s.versionSnaps.some(snapId => !tgtSnaps.has(snapId));
+            if (!card && !meta && !media && !studio && !versions) continue;
             const cardMetaKept = (card || meta) && preferNewer && t.updatedAt > s.updatedAt;
             const studioKept = studio && preferNewer && (t.studioUpdatedAt ?? 0) > (s.studioUpdatedAt ?? 0);
             if (cardMetaKept) plan.kept++;
@@ -53,7 +55,8 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             const syncCard = card && !cardMetaKept;
             const syncMeta = meta && !cardMetaKept;
             const syncStudio = studio && !studioKept;
-            if (!syncCard && !syncMeta && !media && !syncStudio) continue;
+            const syncVersions = versions;
+            if (!syncCard && !syncMeta && !media && !syncStudio && !syncVersions) continue;
             plan.characters.update.push({
                 id: s.id,
                 sourceId,
@@ -61,6 +64,7 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
                 meta: syncMeta,
                 media,
                 ...(syncStudio ? { studio: true } : {}),
+                ...(syncVersions ? { versions: true } : {}),
             });
         }
         if (mirror) plan.characters.delete = target.characters.filter(t => !sourceChars.has(t.id)).map(t => t.id);
@@ -349,8 +353,9 @@ export function alignSource(source, target, aliases = {}) {
         }
     };
 
-    // 2. Same provider link (provider_links: same site + remote id)
+    // 2. Same provider link (provider_links: same site + remote id) or same char_aliases (e.g. version_uid, avatar_file)
     pairUniqueByKeys(c => Array.isArray(c.providerLinks) ? c.providerLinks : []);
+    pairUniqueByKeys(c => Array.isArray(c.charAliases) ? c.charAliases : []);
 
     // 3. Same (name, creator, createDate) when uniquely matching 1-to-1 each way, and at least one of creator/createDate is non-empty
     pairUniqueByKeys((c) => {
