@@ -10,8 +10,8 @@ import { randomId, keyPair, deriveSecret, shortCode, hmac, safeEqual, verifySign
 import { makeStore, deviceName } from './store.js';
 import { createLanDiscovery, detectPlatform } from './discovery.js';
 import { localBase, localClient, peerClient, pairingCall, firstReachable, listenInfo, reachableAddresses, remoteIp } from './http.js';
-import { buildManifestFromDb, buildFileManifest, walk, chatRows, characterWorlds, playlistMembers, DATASETS } from './manifest.js';
-import { runPull, createDbSnapshot, resolveMediaFile } from './sync.js';
+import { buildManifestFromDb, buildFileManifest, walk, chatRows, characterWorlds, playlistMembers, DATASETS, enabledLanSyncExtensions } from './manifest.js';
+import { runPull, createDbSnapshot, resolveMediaFile, mergeDuplicateCharacter } from './sync.js';
 
 const PAIRING_TTL_MS = 10 * 60 * 1000;
 const MAX_PENDING = 5;
@@ -770,7 +770,8 @@ export function register(router, ctx) {
 
     router.get('/peer/file/:kind', signed, (req, res) => {
         const relPath = String(req.query.path || '');
-        const fullPath = resolveMediaFile(req.paths, req.params.kind, relPath);
+        const allowedExtIds = new Set(enabledLanSyncExtensions(req.db).filter(e => e.files).map(e => e.id));
+        const fullPath = resolveMediaFile(req.paths, req.params.kind, relPath, allowedExtIds);
         if (!fullPath) return res.status(400).json({ error: 'Invalid media file path' });
         let stat;
         try {
@@ -864,6 +865,17 @@ export function register(router, ctx) {
             const members = await playlistMembers(local, req.params.id);
             res.json({ id: req.params.id, ...p, members });
         } catch (e) { next(e); }
+    });
+
+    router.post('/characters/merge', (req, res) => {
+        const { store } = parts(req);
+        const { fromId, intoId, peerId = null } = req.body || {};
+        try {
+            const out = mergeDuplicateCharacter(req.db, req.paths, store, { fromId, intoId, peerId });
+            res.json(out);
+        } catch (e) {
+            res.status(400).json({ error: e.message });
+        }
     });
 
     // "push", as TauriTavern does it: the other device asks this one to pull from it. The asker chooses what

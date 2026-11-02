@@ -43,7 +43,7 @@ export function createDbSnapshot(db, { includeConnections = false } = {}) {
 /**
  * Resolve a physical file path inside `paths` for `{ kind, relPath }` safely (prevents path traversal).
  */
-export function resolveMediaFile(paths, kind, relPath) {
+export function resolveMediaFile(paths, kind, relPath, allowedExtIds = null) {
     const roots = {
         avatars: paths?.avatarsDir,
         gallery: paths?.galleryRoot,
@@ -55,8 +55,14 @@ export function resolveMediaFile(paths, kind, relPath) {
     const root = roots[kind];
     if (!root || typeof relPath !== 'string' || !relPath || relPath.includes('\0')) return null;
     if (kind === 'ext') {
-        const firstSeg = relPath.split(/[\\/]/)[0] || '';
+        const parts = relPath.split(/[\\/]/).filter(Boolean);
+        const firstSeg = parts[0] || '';
         if (!/^[a-z0-9][a-z0-9-]{1,59}$/.test(firstSeg) || firstSeg === 'lan-sync') return null;
+        if (parts.some(seg => seg.startsWith('.') || seg === 'seeded-prompts.json')) return null;
+        const allowed = allowedExtIds instanceof Set
+            ? allowedExtIds
+            : (Array.isArray(allowedExtIds) ? new Set(allowedExtIds) : null);
+        if (!allowed || !allowed.has(firstSeg)) return null;
     }
     const base = path.resolve(root);
     const full = path.resolve(base, relPath);
@@ -127,6 +133,7 @@ export async function runPull({ db, paths, ctx, peer, store, options, aliases = 
     const remoteFiles = Array.isArray(remoteFilesResp?.files) ? remoteFilesResp.files : [];
 
     // Remap remote file paths for any aliased characters
+    const allowedExtIds = new Set(enabledLanSyncExtensions(db).filter(e => e.files).map(e => e.id));
     const toFetch = [];
     for (const rf of remoteFiles) {
         let localRel = rf.relPath;
@@ -137,7 +144,7 @@ export async function runPull({ db, paths, ctx, peer, store, options, aliases = 
             // If prefer-newer kept local character card, don't overwrite its avatar
             const charPlan = plan.characters.update.find(u => u.id === dstCharId);
             const isNew = plan.characters.create.includes(srcCharId) || plan.characters.create.includes(dstCharId);
-            const targetPath = resolveMediaFile(paths, 'avatars', localRel);
+            const targetPath = resolveMediaFile(paths, 'avatars', localRel, allowedExtIds);
             const exists = targetPath && fs.existsSync(targetPath);
             if (exists && !isNew && (!charPlan || !charPlan.card)) continue;
         } else if (rf.kind === 'gallery') {
@@ -154,7 +161,7 @@ export async function runPull({ db, paths, ctx, peer, store, options, aliases = 
             localRel = `${dstId}.png`;
         }
 
-        const dstFull = resolveMediaFile(paths, rf.kind, localRel);
+        const dstFull = resolveMediaFile(paths, rf.kind, localRel, allowedExtIds);
         if (!dstFull) continue;
 
         let need = false;
@@ -358,6 +365,16 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
             // ── 3. Personas (personas, persona_worlds, activePersonaId) ──
             const personaIdMap = new Map();
             if (want.has('personas')) {
+                // Map all remote personas to local personas (by id or case-insensitive name) so extension tables
+                // and chats always resolve persona_id even when Prefer-newer kept the local base persona row.
+                const locPersonas = db.prepare('SELECT id, name FROM personas').all();
+                const locById = new Map(locPersonas.map(p => [p.id, p.id]));
+                const locByName = new Map(locPersonas.map(p => [String(p.name || '').trim().toLowerCase(), p.id]));
+                for (const rp of db.prepare('SELECT id, name FROM remote.personas').all()) {
+                    const dst = locById.get(rp.id) || locByName.get(String(rp.name || '').trim().toLowerCase());
+                    if (dst) personaIdMap.set(rp.id, dst);
+                }
+
                 const upsertPersona = db.prepare(upsertSql('personas', ['id']));
                 const syncPersonaRow = (srcId, dstId) => {
                     const rp = db.prepare('SELECT * FROM remote.personas WHERE id = ?').get(srcId);
@@ -376,7 +393,10 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
                 };
 
                 for (const p of plan.personas.create) syncPersonaRow(p.id, p.id);
-                for (const p of plan.personas.update) syncPersonaRow(p.id, p.targetId);
+                for (const p of plan.personas.update) {
+                    personaIdMap.set(p.id, p.targetId);
+                    if (p.base !== false) syncPersonaRow(p.id, p.targetId);
+                }
                 if (mirror) {
                     for (const delId of plan.personas.delete) {
                         if (paths?.personaAvatarsDir) filesToDelete.push(path.join(paths.personaAvatarsDir, `${delId}.png`));
@@ -687,6 +707,10 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
                             if (locTs > remTs) continue;
                         }
                         upsertExt.run(row);
+                        if (table === 'x_evolutia_personas' && row.enabled && row.persona_id) {
+                            db.prepare("UPDATE personas SET description = '{{evolutia_persona}}' WHERE id = ? AND description != '{{evolutia_persona}}'")
+                                .run(row.persona_id);
+                        }
                     }
 
                     if (mirror) {
@@ -733,4 +757,106 @@ function emitSyncChanges(db, ctx) {
     try {
         ctx?.report?.(db, 'library', 'all', { reason: 'resync' });
     } catch { /* ignore */ }
+}
+
+/**
+ * Merge a duplicate character (`fromId`) into an existing original character (`intoId`):
+ * moves chats, gallery media, provider links, tags, worlds, playlists, and x_evolutia_cards
+ * onto `intoId`, deletes `fromId`, and records the alias `fromId -> intoId` in `peers.json`.
+ */
+export function mergeDuplicateCharacter(db, paths, store, { fromId, intoId, peerId = null } = {}) {
+    if (!fromId || !intoId || fromId === intoId) {
+        throw new Error('fromId and intoId must be two distinct character IDs');
+    }
+    const fromRow = db.prepare('SELECT * FROM characters WHERE id = ?').get(fromId);
+    const intoRow = db.prepare('SELECT * FROM characters WHERE id = ?').get(intoId);
+    if (!fromRow || !intoRow) {
+        throw new Error('Both fromId and intoId must exist in characters');
+    }
+
+    db.pragma('foreign_keys = OFF');
+    try {
+        db.transaction(() => {
+            // 1. Move chats
+            db.prepare('UPDATE chats SET char_id = ? WHERE char_id = ?').run(intoId, fromId);
+
+            // 2. Move gallery media rows & physical files
+            const mediaRows = db.prepare('SELECT * FROM media WHERE char_id = ?').all(fromId);
+            for (const m of mediaRows) {
+                const exists = db.prepare('SELECT 1 FROM media WHERE char_id = ? AND file = ?').get(intoId, m.file);
+                if (!exists) {
+                    db.prepare('UPDATE media SET char_id = ? WHERE id = ?').run(intoId, m.id);
+                    if (paths?.galleryRoot) {
+                        const srcFile = path.join(paths.galleryRoot, fromId, m.file);
+                        const dstDir = path.join(paths.galleryRoot, intoId);
+                        const dstFile = path.join(dstDir, m.file);
+                        if (fs.existsSync(srcFile) && !fs.existsSync(dstFile)) {
+                            fs.mkdirSync(dstDir, { recursive: true });
+                            try { fs.renameSync(srcFile, dstFile); } catch { /* ignore */ }
+                        }
+                    }
+                } else {
+                    db.prepare('DELETE FROM media WHERE id = ?').run(m.id);
+                }
+            }
+            if (paths?.galleryRoot) {
+                try { fs.rmSync(path.join(paths.galleryRoot, fromId), { recursive: true, force: true }); } catch { /* ignore */ }
+            }
+
+            // 3. Move tags, worlds, provider_links, playlists, background_bindings
+            for (const r of db.prepare('SELECT tag_id, pos FROM char_tags WHERE char_id = ?').all(fromId)) {
+                db.prepare('INSERT OR IGNORE INTO char_tags (char_id, tag_id, pos) VALUES (?, ?, ?)').run(intoId, r.tag_id, r.pos);
+            }
+            db.prepare('DELETE FROM char_tags WHERE char_id = ?').run(fromId);
+
+            for (const r of db.prepare('SELECT world_name, pos FROM char_worlds WHERE char_id = ?').all(fromId)) {
+                db.prepare('INSERT OR IGNORE INTO char_worlds (char_id, world_name, pos) VALUES (?, ?, ?)').run(intoId, r.world_name, r.pos);
+            }
+            db.prepare('DELETE FROM char_worlds WHERE char_id = ?').run(fromId);
+
+            for (const r of db.prepare('SELECT * FROM provider_links WHERE char_id = ?').all(fromId)) {
+                const hasLink = db.prepare('SELECT 1 FROM provider_links WHERE char_id = ? AND provider_id = ?').get(intoId, r.provider_id);
+                if (!hasLink) {
+                    db.prepare('UPDATE provider_links SET char_id = ? WHERE char_id = ? AND provider_id = ?').run(intoId, fromId, r.provider_id);
+                }
+            }
+            db.prepare('DELETE FROM provider_links WHERE char_id = ?').run(fromId);
+
+            for (const r of db.prepare('SELECT playlist_id, pos FROM playlist_chars WHERE char_id = ?').all(fromId)) {
+                db.prepare('INSERT OR IGNORE INTO playlist_chars (playlist_id, char_id, pos) VALUES (?, ?, ?)').run(r.playlist_id, intoId, r.pos);
+            }
+            db.prepare('DELETE FROM playlist_chars WHERE char_id = ?').run(fromId);
+
+            db.prepare('UPDATE OR IGNORE background_bindings SET char_id = ? WHERE char_id = ?').run(intoId, fromId);
+            db.prepare('DELETE FROM background_bindings WHERE char_id = ?').run(fromId);
+
+            // 4. x_evolutia_cards cleanup
+            try {
+                const fromEvo = db.prepare('SELECT enabled FROM x_evolutia_cards WHERE char_id = ?').get(fromId);
+                if (fromEvo?.enabled) {
+                    db.prepare('INSERT INTO x_evolutia_cards (char_id, enabled) VALUES (?, 1) ON CONFLICT(char_id) DO UPDATE SET enabled = MAX(enabled, excluded.enabled)').run(intoId);
+                }
+                db.prepare('DELETE FROM x_evolutia_cards WHERE char_id = ?').run(fromId);
+            } catch { /* ignore if x_evolutia_cards absent */ }
+
+            try { db.prepare('DELETE FROM versions WHERE char_id = ?').run(fromId); } catch { /* ignore */ }
+            if (paths?.avatarsDir) {
+                try { fs.unlinkSync(path.join(paths.avatarsDir, `${fromId}.png`)); } catch { /* ignore */ }
+            }
+            db.prepare('DELETE FROM characters WHERE id = ?').run(fromId);
+        })();
+    } finally {
+        try { db.pragma('foreign_keys = ON'); } catch { /* ignore */ }
+    }
+
+    // Record alias in peers.json so future syncs map fromId -> intoId
+    if (store) {
+        for (const p of store.peers()) {
+            if (peerId && p.id !== peerId) continue;
+            const aliases = { ...(p.aliases || {}), [fromId]: intoId };
+            store.updatePeer(p.id, { aliases });
+        }
+    }
+
+    return { ok: true, fromId, intoId };
 }

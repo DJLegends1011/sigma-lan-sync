@@ -477,3 +477,75 @@ test('a persona with an x_evolutia_personas row and ext/evolutia/ files arrives 
     const deskNovaRow = (await desk.api('/characters?count=false&limit=100')).body.items.find(r => r.id === ids.nova);
     assert.equal(deskNovaRow.ext?.evolutia?.on, 1, 'x_evolutia_cards synced and rebuilt');
 });
+
+test('prefer-newer uses x_evolutia_personas.updated_at so a newer Evolutia definition arrives even when base persona was edited later on target', async () => {
+    // 1. On phone, add a third Alter Ego ("Black Widow") via PUT /personas/:id/definition (updates x_evolutia_personas.updated_at)
+    const cur = (await phone.api(`/ext/evolutia/personas/${ids.deskPersona}`)).body.definition;
+    cur.alterEgos.push({
+        ...cur.alterEgos[1],
+        id: 'black-widow',
+        name: 'Black Widow',
+        promptName: 'Natasha',
+        displayName: 'Natasha',
+    });
+    await sleep(30);
+    const savedDef = await phone.api(`/ext/evolutia/personas/${ids.deskPersona}/definition`, 'PUT', { definition: cur });
+    assert.equal(savedDef.status, 200);
+
+    // 2. Later on desktop, edit Commander's pronouns (updates personas.updated_at on desktop, leaving desktop's x_evolutia_personas.updated_at older)
+    await sleep(30);
+    const pPatch = await desk.api(`/personas/${ids.deskPersona}`, 'PATCH', {
+        pronouns: { sub: 'he', obj: 'him', poss: 'his', possP: 'his', ref: 'himself' },
+    });
+    assert.equal(pPatch.status, 200, JSON.stringify(pPatch.body));
+
+    // 3. Pull on desktop with overwrite = prefer-newer
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'prefer-newer' });
+    await pull(desk, phoneId);
+
+    // Desktop kept its newer pronouns AND received the phone's newer Evolutia definition
+    const deskPersonas = (await desk.api('/personas')).body.personas;
+    const cmd = deskPersonas.find(p => p.id === ids.deskPersona);
+    assert.equal(cmd.pronouns.sub, 'he', 'desktop kept its newer pronouns');
+    const deskEvo = (await desk.api(`/ext/evolutia/personas/${ids.deskPersona}`)).body;
+    assert.deepEqual(deskEvo.definition.alterEgos.map(e => e.name), ['Commander', 'Ollie', 'Black Widow']);
+
+    // Restore exact overwrite mode for subsequent tests
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'exact' });
+});
+
+test('peer file route refuses undeclared extension folders and internal seeded-prompts.json marker', async () => {
+    // Trigger seed-prompts on phone so seeded-prompts.json exists in phone's ext/evolutia/
+    await phone.api('/ext/evolutia/seed-prompts', 'POST', {});
+    await pull(desk, phoneId);
+    // Desk's assistant-prompts were never seeded yet; verify seeded-prompts.json did NOT sync across to block seeding on desk
+    const seedOnDesk = await desk.api('/ext/evolutia/seed-prompts', 'POST', {});
+    assert.equal(seedOnDesk.status, 200);
+    assert.equal(seedOnDesk.body.seeded, true, 'seeded-prompts.json marker was not synced from phone');
+});
+
+test('same card imported on both devices and edited on one (e.g. Evolutia enabled) still pairs as one character and attaches chats', async () => {
+    const card = { name: 'Vannessa', description: 'Popular campus girl.', first_mes: 'Ugh...', creator: 'wisperrr' };
+    const onDesk = await desk.call('importCard', card);
+    const onPhone = await phone.call('importCard', card);
+    assert.notEqual(onDesk.id, onPhone.id, 'separate imports have different ids');
+
+    // Enable Evolutia on phone's copy (rewrites card description to {{evolutia}}, changing card digest)
+    const evoOn = await phone.api(`/ext/evolutia/characters/${onPhone.id}/on`, 'PUT', { on: true });
+    assert.equal(evoOn.status, 200);
+
+    // Add a chat on phone's Vannessa
+    const ch = await phone.api(`/characters/${onPhone.id}/chats`, 'POST', {
+        name: 'Vannessa - phone branch',
+        messages: [{ name: 'Vannessa', is_user: false, mes: 'Hey there!', send_date: 1700000200000 }],
+    });
+    assert.ok(ch.status < 300);
+
+    await pull(desk, phoneId);
+
+    const vannessas = (await desk.api('/characters?q=Vannessa')).body.items.filter(c => c.name === 'Vannessa');
+    assert.deepEqual(vannessas.map(c => c.id), [onDesk.id], 'still only one Vannessa on desktop');
+    assert.equal(vannessas[0].ext?.evolutia?.on, 1, 'Evolutia state updated on the matched character');
+    const deskChats = (await desk.api(`/chats?charId=${onDesk.id}`)).body.items.map(c => c.name);
+    assert.ok(deskChats.includes('Vannessa - phone branch'), 'phone chat attached to desktop Vannessa');
+});

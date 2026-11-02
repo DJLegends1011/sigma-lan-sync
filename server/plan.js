@@ -104,6 +104,19 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             }
             matchedTargetIds.add(t.id);
             if (t.digest === s.digest) continue;
+            if (s.baseDigest !== undefined && t.baseDigest !== undefined) {
+                const baseDiff = s.baseDigest !== t.baseDigest;
+                const extDiff = (s.extDigest || '') !== (t.extDigest || '');
+                const baseKept = baseDiff && preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0);
+                const extKept = extDiff && preferNewer && (t.extUpdatedAt ?? t.updatedAt ?? 0) > (s.extUpdatedAt ?? s.updatedAt ?? 0);
+                if (baseKept) plan.kept++;
+                if (extKept && !baseKept) plan.kept++;
+                const syncBase = baseDiff && !baseKept;
+                const syncExt = extDiff && !extKept;
+                if (!syncBase && !syncExt) continue;
+                plan.personas.update.push({ id: s.id, targetId: t.id, name: s.name, base: syncBase, ext: syncExt });
+                continue;
+            }
             if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) { plan.kept++; continue; }
             plan.personas.update.push({ id: s.id, targetId: t.id, name: s.name });
         }
@@ -204,6 +217,8 @@ export function alignSource(source, target, aliases = {}) {
     const sourceIds = new Set(source.characters.map(c => c.id));
     const kept = Object.fromEntries(Object.entries(aliases).filter(([from, to]) => targetIds.has(to) && sourceIds.has(from)));
     const claimed = new Set(Object.values(kept));
+
+    // 1. Exact card digest twin match
     const twins = new Map();
     for (const t of target.characters) {
         if (!sourceIds.has(t.id) && !claimed.has(t.id) && !twins.has(t.card)) twins.set(t.card, t.id);
@@ -211,8 +226,59 @@ export function alignSource(source, target, aliases = {}) {
     for (const s of source.characters) {
         if (kept[s.id] || targetIds.has(s.id)) continue;
         const twin = twins.get(s.card);
-        if (twin) { kept[s.id] = twin; twins.delete(s.card); }
+        if (twin) {
+            kept[s.id] = twin;
+            claimed.add(twin);
+            twins.delete(s.card);
+        }
     }
+
+    // Helper: pair unclaimed source & target characters when a key matches 1-to-1 (exactly one candidate each way)
+    const pairUniqueByKeys = (keysOf) => {
+        const srcByKey = new Map();
+        const tgtByKey = new Map();
+        for (const s of source.characters) {
+            if (kept[s.id] || targetIds.has(s.id)) continue;
+            for (const k of keysOf(s)) {
+                if (!k) continue;
+                if (!srcByKey.has(k)) srcByKey.set(k, []);
+                srcByKey.get(k).push(s.id);
+            }
+        }
+        for (const t of target.characters) {
+            if (sourceIds.has(t.id) && !kept[t.id]) continue;
+            if (claimed.has(t.id)) continue;
+            for (const k of keysOf(t)) {
+                if (!k) continue;
+                if (!tgtByKey.has(k)) tgtByKey.set(k, []);
+                tgtByKey.get(k).push(t.id);
+            }
+        }
+        for (const [k, sIds] of srcByKey.entries()) {
+            const tIds = tgtByKey.get(k);
+            if (sIds.length === 1 && tIds?.length === 1) {
+                const sId = sIds[0];
+                const tId = tIds[0];
+                if (!kept[sId] && !claimed.has(tId)) {
+                    kept[sId] = tId;
+                    claimed.add(tId);
+                }
+            }
+        }
+    };
+
+    // 2. Same provider link (provider_links: same site + remote id)
+    pairUniqueByKeys(c => Array.isArray(c.providerLinks) ? c.providerLinks : []);
+
+    // 3. Same (name, creator, createDate) when uniquely matching 1-to-1 each way
+    pairUniqueByKeys((c) => {
+        const nm = nameKey(c);
+        if (!nm) return [];
+        const cr = String(c.creator || '').trim().toLowerCase();
+        const dt = String(c.createDate || '').trim();
+        return [`${nm}\u0000${cr}\u0000${dt}`];
+    });
+
     const local = (id) => kept[id] || id;
     return {
         aliases: kept,

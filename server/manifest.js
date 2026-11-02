@@ -159,9 +159,10 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS } = 
     };
 
     if (want.has('characters') || want.has('chats') || want.has('playlists')) {
-        const chars = db.prepare('SELECT id, name, card, content_hash, fav, update_locked, media_localized, lore_dismissed, updated_at FROM characters ORDER BY name COLLATE NOCASE').all();
+        const chars = db.prepare('SELECT id, name, card, content_hash, fav, update_locked, media_localized, lore_dismissed, created_at, updated_at FROM characters ORDER BY name COLLATE NOCASE').all();
         const tagRows = db.prepare('SELECT ct.char_id, t.name FROM char_tags ct JOIN tags t ON t.id = ct.tag_id ORDER BY ct.char_id, t.name COLLATE NOCASE').all();
         const worldRows = db.prepare('SELECT char_id, world_name FROM char_worlds ORDER BY char_id, pos').all();
+        const linkRows = db.prepare('SELECT char_id, provider_id, external_id, full_path FROM provider_links ORDER BY char_id, provider_id').all();
         const mediaRows = db.prepare("SELECT char_id, COUNT(*) AS n, GROUP_CONCAT(COALESCE(content_hash, file || ':' || COALESCE(size, 0)), '|') AS sig FROM (SELECT char_id, content_hash, file, size FROM media ORDER BY char_id, display_name) GROUP BY char_id").all();
 
         const tagsByChar = new Map();
@@ -174,6 +175,13 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS } = 
             if (!worldsByChar.has(r.char_id)) worldsByChar.set(r.char_id, []);
             worldsByChar.get(r.char_id).push(r.world_name);
         }
+        const linksByChar = new Map();
+        for (const r of linkRows) {
+            const key = `${r.provider_id || ''}:${r.external_id || r.full_path || ''}`;
+            if (!r.provider_id || (!r.external_id && !r.full_path)) continue;
+            if (!linksByChar.has(r.char_id)) linksByChar.set(r.char_id, []);
+            linksByChar.get(r.char_id).push(key);
+        }
         const mediaByChar = new Map(mediaRows.map(r => [r.char_id, { count: r.n, sig: r.sig || '' }]));
 
         for (const c of chars) {
@@ -182,9 +190,19 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS } = 
                 : { etag: '', avatar: '' };
             fresh.chars[c.id] = av;
             const m = mediaByChar.get(c.id) || { count: 0, sig: '' };
+            let creator = '';
+            let createDate = '';
+            try {
+                const parsed = JSON.parse(c.card);
+                creator = String(parsed?.data?.creator ?? '').trim();
+                createDate = String(parsed?.create_date ?? parsed?.data?.create_date ?? parsed?.data?.extensions?.create_date ?? '').trim();
+            } catch { /* ignore */ }
             manifest.characters.push({
                 id: c.id,
                 name: c.name || '',
+                creator,
+                createDate,
+                providerLinks: linksByChar.get(c.id) || [],
                 updatedAt: c.updated_at ?? 0,
                 mediaCount: m.count,
                 mediaSig: sha256(m.sig),
@@ -275,25 +293,32 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS } = 
                 : { etag: '', avatar: '' };
             fresh.personas[p.id] = av;
             const extData = extPersonaRows.get(p.id) || null;
+            const baseDigest = sha256(canon({
+                name: p.name || '',
+                description: p.description || '',
+                pronouns: {
+                    sub: p.pronoun_sub ?? '',
+                    obj: p.pronoun_obj ?? '',
+                    poss: p.pronoun_poss ?? '',
+                    possP: p.pronoun_poss_p ?? '',
+                    ref: p.pronoun_ref ?? '',
+                },
+                worlds: worldsByPersona.get(p.id) || [],
+                avatar: av.avatar,
+            }));
+            const extDigest = extData ? sha256(canon(extData)) : '';
+            const extUpdatedAt = extData
+                ? Math.max(0, ...Object.values(extData).map(r => Number(r?.updated_at) || 0))
+                : 0;
             manifest.personas.push({
                 id: p.id,
                 name: p.name || '',
                 updatedAt: p.updated_at ?? 0,
+                extUpdatedAt,
+                baseDigest,
+                extDigest,
                 hasAvatar: !!av.avatar,
-                digest: sha256(canon({
-                    name: p.name || '',
-                    description: p.description || '',
-                    pronouns: {
-                        sub: p.pronoun_sub ?? '',
-                        obj: p.pronoun_obj ?? '',
-                        poss: p.pronoun_poss ?? '',
-                        possP: p.pronoun_poss_p ?? '',
-                        ref: p.pronoun_ref ?? '',
-                    },
-                    worlds: worldsByPersona.get(p.id) || [],
-                    avatar: av.avatar,
-                    ...(extData ? { ext: extData } : {}),
-                })),
+                digest: extDigest ? sha256(`${baseDigest}|${extDigest}`) : baseDigest,
             });
         }
     }
@@ -417,6 +442,7 @@ export function buildFileManifest(db, paths, { datasets = DATASETS } = {}) {
             let entries = [];
             try { entries = fs.readdirSync(baseDir, { withFileTypes: true }); } catch { return; }
             for (const entry of entries) {
+                if (entry.name.startsWith('.') || entry.name === 'seeded-prompts.json') continue;
                 const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
                 const full = path.join(baseDir, entry.name);
                 if (entry.isDirectory()) walkExtDir(extId, full, rel);
