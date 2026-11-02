@@ -412,3 +412,68 @@ test('direct QR-less pairing, peer renaming, and auto-sync configuration work wi
     assert.equal(autoRes.body.config.targetId, deskId);
     assert.ok(autoRes.body.status.nextRunAtMs > Date.now());
 });
+
+test('a persona with an x_evolutia_personas row and ext/evolutia/ files arrives on the other side', async () => {
+    // Turn Evolutia on for Commander on the phone with a new Alter Ego ("Ollie") and an uploaded avatar file
+    const tinyPng = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+    const up = await phone.api('/ext/evolutia/avatars', 'POST', { filename: 'ollie.png', dataUrl: tinyPng });
+    assert.equal(up.status, 200, JSON.stringify(up.body));
+    const uploadedFile = up.body.file;
+
+    const definition = {
+        alterEgos: [
+            {
+                id: 'base',
+                name: 'Commander',
+                fields: [{ id: 'f1', name: 'Role', content: 'Fleet captain.', startsOn: true, activating: { keywords: [], mode: 'ANY' }, enabling: { keywords: [], mode: 'ANY' }, disabling: { keywords: [], mode: 'ANY' }, sources: { user: true, char: true }, entryAction: null, exitAction: null, entryConfirm: null, exitConfirm: null }],
+                entry: { keywords: [], mode: 'ANY' },
+                entrySources: { user: true, char: true },
+                entryAction: null,
+                exitAction: null,
+                entryConfirm: null,
+                exitConfirm: null,
+                promptName: null,
+                displayName: null,
+                avatar: null,
+            },
+            {
+                id: 'ollie',
+                name: 'Ollie',
+                disguise: true,
+                fields: [{ id: 'f2', name: 'Appearance', content: 'Undercover cadet.', startsOn: true, activating: { keywords: [], mode: 'ANY' }, enabling: { keywords: [], mode: 'ANY' }, disabling: { keywords: [], mode: 'ANY' }, sources: { user: true, char: true }, entryAction: null, exitAction: null, entryConfirm: null, exitConfirm: null }],
+                entry: { keywords: ['ollie'], mode: 'ANY' },
+                entrySources: { user: true, char: true },
+                entryAction: null,
+                exitAction: null,
+                entryConfirm: null,
+                exitConfirm: null,
+                promptName: 'Ollie',
+                displayName: 'Ollie',
+                avatar: { upload: uploadedFile },
+            },
+        ],
+    };
+
+    const onRes = await phone.api(`/ext/evolutia/personas/${ids.deskPersona}/on`, 'PUT', { on: true, definition });
+    assert.equal(onRes.status, 200, JSON.stringify(onRes.body));
+
+    // Also switch Evolutia on for Nova on the phone so x_evolutia_cards is exercised
+    const charOn = await phone.api(`/ext/evolutia/characters/${ids.nova}/on`, 'PUT', { on: true });
+    assert.equal(charOn.status, 200, JSON.stringify(charOn.body));
+
+    // Desktop pulls from the phone
+    const counts = await dryRun(desk, phoneId);
+    assert.equal(counts.personasChanged, 1, 'manifest digest reflects x_evolutia_personas change');
+    await pull(desk, phoneId);
+
+    const deskEvoPersona = await desk.api(`/ext/evolutia/personas/${ids.deskPersona}`);
+    assert.equal(deskEvoPersona.status, 200, JSON.stringify(deskEvoPersona.body));
+    assert.equal(deskEvoPersona.body.on, true);
+    assert.deepEqual(deskEvoPersona.body.definition.alterEgos.map(e => e.name), ['Commander', 'Ollie']);
+
+    const deskAvatar = await fetch(`${desk.base}/api/ext/evolutia/avatars/${encodeURIComponent(uploadedFile)}`);
+    assert.equal(deskAvatar.status, 200, 'ext/evolutia/ avatar file synced across');
+
+    const deskNovaRow = (await desk.api('/characters?count=false&limit=100')).body.items.find(r => r.id === ids.nova);
+    assert.equal(deskNovaRow.ext?.evolutia?.on, 1, 'x_evolutia_cards synced and rebuilt');
+});

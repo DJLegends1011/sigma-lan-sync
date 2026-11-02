@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildManifestFromDb, buildFileManifest, eachLimited, DATASETS } from './manifest.js';
+import { buildManifestFromDb, buildFileManifest, eachLimited, DATASETS, enabledLanSyncExtensions } from './manifest.js';
 import { makePlan, planCounts, planSize, alignSource } from './plan.js';
 
 const enc = encodeURIComponent;
@@ -45,14 +45,19 @@ export function createDbSnapshot(db, { includeConnections = false } = {}) {
  */
 export function resolveMediaFile(paths, kind, relPath) {
     const roots = {
-        avatars: paths.avatarsDir,
-        gallery: paths.galleryRoot,
-        personas: paths.personaAvatarsDir,
-        attachments: paths.attachmentsRoot,
-        backgrounds: paths.backgroundsDir,
+        avatars: paths?.avatarsDir,
+        gallery: paths?.galleryRoot,
+        personas: paths?.personaAvatarsDir,
+        attachments: paths?.attachmentsRoot,
+        backgrounds: paths?.backgroundsDir,
+        ext: paths?.root ? path.join(paths.root, 'ext') : null,
     };
     const root = roots[kind];
     if (!root || typeof relPath !== 'string' || !relPath || relPath.includes('\0')) return null;
+    if (kind === 'ext') {
+        const firstSeg = relPath.split(/[\\/]/)[0] || '';
+        if (!/^[a-z0-9][a-z0-9-]{1,59}$/.test(firstSeg) || firstSeg === 'lan-sync') return null;
+    }
     const base = path.resolve(root);
     const full = path.resolve(base, relPath);
     const rel = path.relative(base, full);
@@ -621,6 +626,77 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
                     const mappedChar = bb.char_id ? (aliases[bb.char_id] || bb.char_id) : null;
                     if (db.prepare('SELECT 1 FROM backgrounds WHERE id = ?').get(bb.background_id)) {
                         insBinding.run({ ...bb, char_id: mappedChar });
+                    }
+                }
+            }
+
+            // ── 8b. Enabled Extensions' Declared Tables (lanSync.tables) ──
+            for (const ext of enabledLanSyncExtensions(db)) {
+                const prefix = `x_${ext.id.replace(/-/g, '_')}_`;
+                for (const table of ext.tables) {
+                    if (!table.startsWith(prefix) || !/^x_[a-z0-9_]+$/.test(table)) continue;
+                    const localTableExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+                    const remoteTableExists = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = ?").get(table);
+                    if (!localTableExists || !remoteTableExists) continue;
+
+                    const colInfo = db.pragma(`table_info("${table}")`);
+                    const pkCols = colInfo.filter(c => c.pk > 0).sort((a, b) => a.pk - b.pk).map(c => c.name);
+                    if (!pkCols.length) continue;
+                    const colNames = new Set(colInfo.map(c => c.name));
+
+                    if (colNames.has('persona_id') && !want.has('personas')) continue;
+                    if (colNames.has('char_id') && !want.has('characters')) continue;
+
+                    const upsertExt = db.prepare(upsertSql(table, pkCols));
+                    const pkKey = (r) => JSON.stringify(pkCols.map(k => r[k]));
+                    const localRows = new Map(db.prepare(`SELECT * FROM "${table}"`).all().map(r => [pkKey(r), r]));
+                    const remoteRows = db.prepare(`SELECT * FROM remote."${table}"`).all();
+
+                    const rowTimestamp = (schema, r, rawOwnerId) => {
+                        if (r?.updated_at != null) return Number(r.updated_at) || 0;
+                        if (colNames.has('persona_id') && rawOwnerId) {
+                            return Number(db.prepare(`SELECT updated_at FROM ${schema}.personas WHERE id = ?`).get(rawOwnerId)?.updated_at) || 0;
+                        }
+                        if (colNames.has('char_id') && rawOwnerId) {
+                            return Number(db.prepare(`SELECT updated_at FROM ${schema}.characters WHERE id = ?`).get(rawOwnerId)?.updated_at) || 0;
+                        }
+                        return 0;
+                    };
+
+                    const seenPks = new Set();
+                    for (const rRow of remoteRows) {
+                        const row = { ...rRow };
+                        const rawOwnerId = colNames.has('persona_id') ? rRow.persona_id : (colNames.has('char_id') ? rRow.char_id : null);
+                        if (colNames.has('persona_id') && row.persona_id) {
+                            const dstPid = personaIdMap.get(row.persona_id) || row.persona_id;
+                            if (!db.prepare('SELECT 1 FROM personas WHERE id = ?').get(dstPid)) continue;
+                            row.persona_id = dstPid;
+                        }
+                        if (colNames.has('char_id') && row.char_id) {
+                            const dstCid = aliases[row.char_id] || row.char_id;
+                            if (!db.prepare('SELECT 1 FROM characters WHERE id = ?').get(dstCid)) continue;
+                            row.char_id = dstCid;
+                        }
+                        const k = pkKey(row);
+                        seenPks.add(k);
+                        const existing = localRows.get(k);
+                        if (existing && preferNewer) {
+                            const localOwnerId = colNames.has('persona_id') ? existing.persona_id : (colNames.has('char_id') ? existing.char_id : null);
+                            const remTs = rowTimestamp('remote', rRow, rawOwnerId);
+                            const locTs = rowTimestamp('main', existing, localOwnerId);
+                            if (locTs > remTs) continue;
+                        }
+                        upsertExt.run(row);
+                    }
+
+                    if (mirror) {
+                        const whereClause = pkCols.map(c => `"${c}" = ?`).join(' AND ');
+                        const delStmt = db.prepare(`DELETE FROM "${table}" WHERE ${whereClause}`);
+                        for (const [k, lRow] of localRows) {
+                            if (!seenPks.has(k)) {
+                                delStmt.run(...pkCols.map(c => lRow[c]));
+                            }
+                        }
                     }
                 }
             }

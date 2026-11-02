@@ -1,10 +1,51 @@
 // A library's manifest, read straight from SQLite (req.db) and the disk folders (req.paths).
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { canon, sha256 } from './crypto.js';
 
 export const DATASETS = ['characters', 'chats', 'lorebooks', 'personas', 'presets', 'playlists', 'backgrounds', 'connections'];
 const PAGE = 1000;
+const EXT_ID_RE = /^[a-z0-9][a-z0-9-]{1,59}$/;
+
+/**
+ * Discover enabled extensions in `db` that declare `lanSync: { tables?: string[], files?: boolean }`
+ * in their `manifest.json`. Only tables named `x_<id_with_underscores>_*` are accepted.
+ */
+export function enabledLanSyncExtensions(db) {
+    if (!db) return [];
+    let enabledIds = [];
+    try {
+        const row = db.prepare("SELECT value FROM settings WHERE key = 'enabledExtensions'").get();
+        if (row?.value) {
+            const parsed = JSON.parse(row.value);
+            if (Array.isArray(parsed)) enabledIds = parsed.filter(x => typeof x === 'string' && EXT_ID_RE.test(x));
+        }
+    } catch { return []; }
+    if (!enabledIds.length) return [];
+
+    const installedRoot = process.env.CL_EXTENSIONS_DIR
+        ? path.resolve(process.env.CL_EXTENSIONS_DIR)
+        : path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+
+    const out = [];
+    for (const id of enabledIds) {
+        if (id === 'lan-sync') continue;
+        try {
+            const mPath = path.join(installedRoot, id, 'manifest.json');
+            if (!fs.existsSync(mPath)) continue;
+            const m = JSON.parse(fs.readFileSync(mPath, 'utf8'));
+            const ls = m?.lanSync;
+            if (!ls || typeof ls !== 'object' || Array.isArray(ls)) continue;
+            const prefix = `x_${id.replace(/-/g, '_')}_`;
+            const tables = (Array.isArray(ls.tables) ? ls.tables : [])
+                .filter(t => typeof t === 'string' && t.startsWith(prefix) && /^x_[a-z0-9_]+$/.test(t));
+            const files = ls.files === true;
+            if (tables.length || files) out.push({ id, tables, files });
+        } catch { /* ignore unreadable extension manifest */ }
+    }
+    return out;
+}
 
 /** Run fn over items, a few at a time, in order of completion. */
 export async function eachLimited(items, limit, fn, signal) {
@@ -211,11 +252,29 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS } = 
             if (!worldsByPersona.has(r.persona_id)) worldsByPersona.set(r.persona_id, []);
             worldsByPersona.get(r.persona_id).push(r.world_name);
         }
+        // Include any enabled extension's persona-linked tables (e.g. x_evolutia_personas) in the persona digest
+        const extPersonaRows = new Map();
+        for (const ext of enabledLanSyncExtensions(db)) {
+            for (const table of ext.tables) {
+                try {
+                    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
+                    if (!exists) continue;
+                    const cols = db.pragma(`table_info("${table}")`).map(c => c.name);
+                    if (!cols.includes('persona_id')) continue;
+                    for (const r of db.prepare(`SELECT * FROM "${table}"`).all()) {
+                        if (!r.persona_id) continue;
+                        if (!extPersonaRows.has(r.persona_id)) extPersonaRows.set(r.persona_id, {});
+                        extPersonaRows.get(r.persona_id)[table] = r;
+                    }
+                } catch { /* ignore */ }
+            }
+        }
         for (const p of personas) {
             const av = paths?.personaAvatarsDir && p.avatar
                 ? fileAvatarHash(path.join(paths.personaAvatarsDir, `${p.id}.png`), cache.personas, p.id)
                 : { etag: '', avatar: '' };
             fresh.personas[p.id] = av;
+            const extData = extPersonaRows.get(p.id) || null;
             manifest.personas.push({
                 id: p.id,
                 name: p.name || '',
@@ -233,6 +292,7 @@ export function buildManifestFromDb(db, paths, store, { datasets = DATASETS } = 
                     },
                     worlds: worldsByPersona.get(p.id) || [],
                     avatar: av.avatar,
+                    ...(extData ? { ext: extData } : {}),
                 })),
             });
         }
@@ -350,6 +410,22 @@ export function buildFileManifest(db, paths, { datasets = DATASETS } = {}) {
     if (want.has('backgrounds')) {
         for (const b of db.prepare('SELECT file, size FROM backgrounds').iterate()) {
             pushIf('backgrounds', b.file, path.join(paths.backgroundsDir, b.file), b.size);
+        }
+    }
+    if (paths?.root) {
+        const walkExtDir = (extId, baseDir, relPrefix = '') => {
+            let entries = [];
+            try { entries = fs.readdirSync(baseDir, { withFileTypes: true }); } catch { return; }
+            for (const entry of entries) {
+                const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+                const full = path.join(baseDir, entry.name);
+                if (entry.isDirectory()) walkExtDir(extId, full, rel);
+                else if (entry.isFile()) pushIf('ext', `${extId}/${rel}`, full);
+            }
+        };
+        for (const ext of enabledLanSyncExtensions(db)) {
+            if (!ext.files) continue;
+            walkExtDir(ext.id, path.join(paths.root, 'ext', ext.id));
         }
     }
     return files;

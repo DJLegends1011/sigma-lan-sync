@@ -497,6 +497,20 @@ export function createPanel(ctx) {
         if (sumEl) sumEl.textContent = optionsSummaryText();
     }
 
+    let hadRunningJob = false;
+
+    async function runAfterSyncCommands() {
+        try {
+            const cmds = ctx.commands?.list?.() || [];
+            for (const c of cmds) {
+                const cmdId = typeof c === 'string' ? c : c?.id;
+                if (typeof cmdId === 'string' && /\.(afterSync|after-sync|aftersync)$/.test(cmdId)) {
+                    await ctx.commands.run(cmdId).catch(() => {});
+                }
+            }
+        } catch { /* ignore */ }
+    }
+
     async function tick() {
         if (!body) return;
         if (offer && offer.expiresAt <= Date.now()) {
@@ -514,14 +528,19 @@ export function createPanel(ctx) {
             const nextReqs = JSON.stringify(nextStatus.requests || []);
             const prevNearby = JSON.stringify(status?.nearby || []);
             const nextNearby = JSON.stringify(nextStatus.nearby || []);
-            const busy = (status?.jobs || []).some(j => j.status === 'running' || j.status === 'queued')
-                || (nextStatus.jobs || []).some(j => j.status === 'running' || j.status === 'queued');
+            const nowRunning = (nextStatus.jobs || []).some(j => j.status === 'running' || j.status === 'queued');
+            const busy = hadRunningJob || nowRunning;
+            const justFinished = hadRunningJob && !nowRunning && (nextStatus.jobs || []).some(j => j.status === 'done');
+            hadRunningJob = nowRunning;
             status = nextStatus;
             requests = nextStatus.requests || [];
             if (prevReqs !== nextReqs) paintRequests();
             if (prevNearby !== nextNearby || busy) {
                 paintDevice();
                 paintPeers();
+            }
+            if (justFinished) {
+                runAfterSyncCommands();
             }
         } catch { /* next tick retries */ }
     }
