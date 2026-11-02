@@ -566,7 +566,7 @@ test('same card imported on both devices and edited on one (with creator) pairs 
     const deskChats = (await desk.api(`/chats?charId=${onDesk.id}`)).body.items.map(c => c.name);
     assert.ok(deskChats.includes('Vannessa - phone branch'), 'phone chat attached to desktop Vannessa');
 
-    // Now test /characters/merge on two separate characters on desktop
+    // Now test /characters/merge on two separate characters on desktop, including a gallery picture on the duplicate
     const dupA = await desk.call('importCard', { name: 'DupHero', description: 'Version A', first_mes: 'A' });
     const dupB = await desk.call('importCard', { name: 'DupHero', description: 'Version B', first_mes: 'B' });
     const dupChat = await desk.api(`/characters/${dupB.id}/chats`, 'POST', {
@@ -574,6 +574,13 @@ test('same card imported on both devices and edited on one (with creator) pairs 
         messages: [{ name: 'DupHero', is_user: false, mes: 'From B!', send_date: 1700000300000 }],
     });
     assert.ok(dupChat.status < 300);
+
+    const png = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000'
+        + '1f15c4890000000d4944415478da63f8cfc0f01f0005000201a5c4d3b40000000049454e44ae426082', 'hex');
+    const upMedia = await fetch(`${desk.base}/api/characters/${dupB.id}/media?name=trophy.png`, {
+        method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: png,
+    });
+    assert.equal(upMedia.status, 200);
 
     const merged = await desk.ext('/characters/merge', 'POST', { fromId: dupB.id, intoId: dupA.id });
     assert.equal(merged.status, 200, JSON.stringify(merged.body));
@@ -583,4 +590,12 @@ test('same card imported on both devices and edited on one (with creator) pairs 
     const keptRow = (await desk.api(`/characters/${dupA.id}`)).body;
     assert.equal(keptRow.chatCount, 1, 'chat_count recounted on original');
     assert.ok(keptRow.lastChatAt > 0, 'last_chat_at recounted on original');
+
+    // Check that the duplicate's gallery picture was moved before deleteCharacters and is served under the original
+    const mediaList = (await desk.api(`/characters/${dupA.id}/media`)).body.items;
+    assert.equal(mediaList.length, 1);
+    assert.equal(mediaList[0].displayName, 'trophy.png');
+    const servedMedia = await fetch(`${desk.base}${mediaList[0].url}`);
+    assert.equal(servedMedia.status, 200, 'gallery picture is served under the original character');
+    assert.ok(Buffer.from(await servedMedia.arrayBuffer()).equals(png), 'gallery picture bytes match');
 });

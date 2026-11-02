@@ -790,107 +790,117 @@ export function mergeDuplicateCharacter(db, paths, store, { fromId, intoId, peer
     }
 
     const movedChatIds = db.prepare('SELECT id FROM chats WHERE char_id = ?').pluck().all(fromId);
-    const galleryMoves = [];
+    const movedFiles = [];
 
-    db.transaction(() => {
-        // 1. Move chats & studio sessions (foreign_keys stays ON; intoId is a valid character)
-        db.prepare('UPDATE chats SET char_id = ? WHERE char_id = ?').run(intoId, fromId);
-        try { db.prepare('UPDATE studio_sessions SET char_id = ? WHERE char_id = ?').run(intoId, fromId); } catch { /* ignore */ }
+    try {
+        db.transaction(() => {
+            // 1. Move chats & studio sessions (foreign_keys stays ON; intoId is a valid character)
+            db.prepare('UPDATE chats SET char_id = ? WHERE char_id = ?').run(intoId, fromId);
+            try { db.prepare('UPDATE studio_sessions SET char_id = ? WHERE char_id = ?').run(intoId, fromId); } catch { /* ignore */ }
 
-        // 2. Move gallery media rows
-        const mediaRows = db.prepare('SELECT * FROM media WHERE char_id = ?').all(fromId);
-        for (const m of mediaRows) {
-            const exists = db.prepare('SELECT 1 FROM media WHERE char_id = ? AND file = ?').get(intoId, m.file);
-            if (!exists) {
-                db.prepare('UPDATE media SET char_id = ? WHERE id = ?').run(intoId, m.id);
-                galleryMoves.push(m.file);
-            } else {
-                db.prepare('DELETE FROM media WHERE id = ?').run(m.id);
-            }
-        }
-
-        // 3. Move tags, worlds, provider_links, playlists, background_bindings
-        for (const r of db.prepare('SELECT tag_id, pos FROM char_tags WHERE char_id = ?').all(fromId)) {
-            db.prepare('INSERT OR IGNORE INTO char_tags (char_id, tag_id, pos) VALUES (?, ?, ?)').run(intoId, r.tag_id, r.pos);
-        }
-        db.prepare('DELETE FROM char_tags WHERE char_id = ?').run(fromId);
-
-        for (const r of db.prepare('SELECT world_name, pos FROM char_worlds WHERE char_id = ?').all(fromId)) {
-            db.prepare('INSERT OR IGNORE INTO char_worlds (char_id, world_name, pos) VALUES (?, ?, ?)').run(intoId, r.world_name, r.pos);
-        }
-        db.prepare('DELETE FROM char_worlds WHERE char_id = ?').run(fromId);
-
-        for (const r of db.prepare('SELECT * FROM provider_links WHERE char_id = ?').all(fromId)) {
-            const hasLink = db.prepare('SELECT 1 FROM provider_links WHERE char_id = ? AND provider_id = ?').get(intoId, r.provider_id);
-            if (!hasLink) {
-                db.prepare('UPDATE provider_links SET char_id = ? WHERE char_id = ? AND provider_id = ?').run(intoId, fromId, r.provider_id);
-            }
-        }
-        db.prepare('DELETE FROM provider_links WHERE char_id = ?').run(fromId);
-
-        for (const r of db.prepare('SELECT playlist_id, pos FROM playlist_chars WHERE char_id = ?').all(fromId)) {
-            db.prepare('INSERT OR IGNORE INTO playlist_chars (playlist_id, char_id, pos) VALUES (?, ?, ?)').run(r.playlist_id, intoId, r.pos);
-        }
-        db.prepare('DELETE FROM playlist_chars WHERE char_id = ?').run(fromId);
-
-        db.prepare('UPDATE OR IGNORE background_bindings SET char_id = ? WHERE char_id = ?').run(intoId, fromId);
-        db.prepare('DELETE FROM background_bindings WHERE char_id = ?').run(fromId);
-
-        // 4. Move any extension x_* tables with a char_id column
-        const extTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'x_%'").pluck().all();
-        for (const tbl of extTables) {
-            try {
-                const cols = db.pragma(`table_info("${tbl}")`).map(c => c.name);
-                if (!cols.includes('char_id')) continue;
-                if (cols.includes('enabled') && cols.length === 2) {
-                    const fromExt = db.prepare(`SELECT enabled FROM "${tbl}" WHERE char_id = ?`).get(fromId);
-                    if (fromExt?.enabled) {
-                        db.prepare(`INSERT INTO "${tbl}" (char_id, enabled) VALUES (?, 1) ON CONFLICT(char_id) DO UPDATE SET enabled = MAX(enabled, excluded.enabled)`).run(intoId);
+            // 2. Move gallery media rows AND rename physical gallery files BEFORE deleteCharacters runs
+            // (because deleteCharacters deletes gallery/<fromId> as soon as its inner transaction returns).
+            const mediaRows = db.prepare('SELECT * FROM media WHERE char_id = ?').all(fromId);
+            for (const m of mediaRows) {
+                const exists = db.prepare('SELECT 1 FROM media WHERE char_id = ? AND file = ?').get(intoId, m.file);
+                if (!exists) {
+                    db.prepare('UPDATE media SET char_id = ? WHERE id = ?').run(intoId, m.id);
+                    if (paths?.galleryRoot) {
+                        const srcFile = path.join(paths.galleryRoot, fromId, m.file);
+                        const dstDir = path.join(paths.galleryRoot, intoId);
+                        const dstFile = path.join(dstDir, m.file);
+                        if (fs.existsSync(srcFile) && !fs.existsSync(dstFile)) {
+                            fs.mkdirSync(dstDir, { recursive: true });
+                            fs.renameSync(srcFile, dstFile);
+                            movedFiles.push({ srcFile, dstFile });
+                        }
                     }
                 } else {
-                    db.prepare(`UPDATE OR IGNORE "${tbl}" SET char_id = ? WHERE char_id = ?`).run(intoId, fromId);
+                    db.prepare('DELETE FROM media WHERE id = ?').run(m.id);
                 }
-                db.prepare(`DELETE FROM "${tbl}" WHERE char_id = ?`).run(fromId);
+            }
+
+            // 3. Move tags, worlds, provider_links, playlists, background_bindings
+            for (const r of db.prepare('SELECT tag_id, pos FROM char_tags WHERE char_id = ?').all(fromId)) {
+                db.prepare('INSERT OR IGNORE INTO char_tags (char_id, tag_id, pos) VALUES (?, ?, ?)').run(intoId, r.tag_id, r.pos);
+            }
+            db.prepare('DELETE FROM char_tags WHERE char_id = ?').run(fromId);
+
+            for (const r of db.prepare('SELECT world_name, pos FROM char_worlds WHERE char_id = ?').all(fromId)) {
+                db.prepare('INSERT OR IGNORE INTO char_worlds (char_id, world_name, pos) VALUES (?, ?, ?)').run(intoId, r.world_name, r.pos);
+            }
+            db.prepare('DELETE FROM char_worlds WHERE char_id = ?').run(fromId);
+
+            for (const r of db.prepare('SELECT * FROM provider_links WHERE char_id = ?').all(fromId)) {
+                const hasLink = db.prepare('SELECT 1 FROM provider_links WHERE char_id = ? AND provider_id = ?').get(intoId, r.provider_id);
+                if (!hasLink) {
+                    db.prepare('UPDATE provider_links SET char_id = ? WHERE char_id = ? AND provider_id = ?').run(intoId, fromId, r.provider_id);
+                }
+            }
+            db.prepare('DELETE FROM provider_links WHERE char_id = ?').run(fromId);
+
+            for (const r of db.prepare('SELECT playlist_id, pos FROM playlist_chars WHERE char_id = ?').all(fromId)) {
+                db.prepare('INSERT OR IGNORE INTO playlist_chars (playlist_id, char_id, pos) VALUES (?, ?, ?)').run(r.playlist_id, intoId, r.pos);
+            }
+            db.prepare('DELETE FROM playlist_chars WHERE char_id = ?').run(fromId);
+
+            db.prepare('UPDATE OR IGNORE background_bindings SET char_id = ? WHERE char_id = ?').run(intoId, fromId);
+            db.prepare('DELETE FROM background_bindings WHERE char_id = ?').run(fromId);
+
+            // 4. Move any extension x_* tables with a char_id column
+            const extTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'x_%'").pluck().all();
+            for (const tbl of extTables) {
+                try {
+                    const cols = db.pragma(`table_info("${tbl}")`).map(c => c.name);
+                    if (!cols.includes('char_id')) continue;
+                    if (cols.includes('enabled') && cols.length === 2) {
+                        const fromExt = db.prepare(`SELECT enabled FROM "${tbl}" WHERE char_id = ?`).get(fromId);
+                        if (fromExt?.enabled) {
+                            db.prepare(`INSERT INTO "${tbl}" (char_id, enabled) VALUES (?, 1) ON CONFLICT(char_id) DO UPDATE SET enabled = MAX(enabled, excluded.enabled)`).run(intoId);
+                        }
+                    } else {
+                        db.prepare(`UPDATE OR IGNORE "${tbl}" SET char_id = ? WHERE char_id = ?`).run(intoId, fromId);
+                    }
+                    db.prepare(`DELETE FROM "${tbl}" WHERE char_id = ?`).run(fromId);
+                } catch { /* ignore */ }
+            }
+
+            // 5. Delete the duplicate character with foreign_keys ON so ON DELETE CASCADE cleans up
+            // char_aliases, media_jobs, tag_run_links, versions, etc.
+            if (ctx?.stores?.characters?.deleteCharacters) {
+                ctx.stores.characters.deleteCharacters(db, paths || {}, [fromId]);
+            } else {
+                db.prepare('DELETE FROM characters WHERE id = ?').run(fromId);
+                if (paths?.galleryRoot) {
+                    try { fs.rmSync(path.join(paths.galleryRoot, fromId), { recursive: true, force: true }); } catch { /* ignore */ }
+                }
+                if (paths?.avatarsDir) {
+                    try { fs.unlinkSync(path.join(paths.avatarsDir, `${fromId}.png`)); } catch { /* ignore */ }
+                }
+            }
+
+            // 6. Verify/recount chat_count and last_chat_at on intoId
+            db.prepare(`
+                UPDATE characters
+                SET chat_count = (SELECT COUNT(*) FROM chats ch WHERE ch.char_id = ?),
+                    last_chat_at = (SELECT MAX(ch.sort_at) FROM chats ch WHERE ch.char_id = ?)
+                WHERE id = ?
+            `).run(intoId, intoId, intoId);
+
+            try {
+                ctx?.report?.(db, { entity: 'character', op: 'updated', ids: [intoId] });
+                if (movedChatIds.length) ctx?.report?.(db, { entity: 'chat', op: 'updated', ids: movedChatIds });
+            } catch { /* ignore */ }
+        })();
+    } catch (err) {
+        // Roll back any renamed gallery files if the transaction failed
+        for (const { srcFile, dstFile } of movedFiles.reverse()) {
+            try {
+                fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+                if (fs.existsSync(dstFile) && !fs.existsSync(srcFile)) fs.renameSync(dstFile, srcFile);
             } catch { /* ignore */ }
         }
-
-        // 5. Delete the duplicate character with foreign_keys ON so ON DELETE CASCADE cleans up
-        // char_aliases, media_jobs, tag_run_links, versions, etc.
-        if (ctx?.stores?.characters?.deleteCharacters) {
-            ctx.stores.characters.deleteCharacters(db, paths || {}, [fromId]);
-        } else {
-            db.prepare('DELETE FROM characters WHERE id = ?').run(fromId);
-        }
-
-        // 6. Verify/recount chat_count and last_chat_at on intoId
-        db.prepare(`
-            UPDATE characters
-            SET chat_count = (SELECT COUNT(*) FROM chats ch WHERE ch.char_id = ?),
-                last_chat_at = (SELECT MAX(ch.sort_at) FROM chats ch WHERE ch.char_id = ?)
-            WHERE id = ?
-        `).run(intoId, intoId, intoId);
-
-        try {
-            ctx?.report?.(db, { entity: 'character', op: 'updated', ids: [intoId] });
-            if (movedChatIds.length) ctx?.report?.(db, { entity: 'chat', op: 'updated', ids: movedChatIds });
-        } catch { /* ignore */ }
-    })();
-
-    // Move physical gallery files after the DB transaction commits
-    if (paths?.galleryRoot) {
-        for (const file of galleryMoves) {
-            const srcFile = path.join(paths.galleryRoot, fromId, file);
-            const dstDir = path.join(paths.galleryRoot, intoId);
-            const dstFile = path.join(dstDir, file);
-            if (fs.existsSync(srcFile) && !fs.existsSync(dstFile)) {
-                fs.mkdirSync(dstDir, { recursive: true });
-                try { fs.renameSync(srcFile, dstFile); } catch { /* ignore */ }
-            }
-        }
-        try { fs.rmSync(path.join(paths.galleryRoot, fromId), { recursive: true, force: true }); } catch { /* ignore */ }
-    }
-    if (paths?.avatarsDir) {
-        try { fs.unlinkSync(path.join(paths.avatarsDir, `${fromId}.png`)); } catch { /* ignore */ }
+        throw err;
     }
 
     // Record alias in peers.json so future syncs map fromId -> intoId
