@@ -39,6 +39,7 @@ const COUNT_WORDS = [
     ['backgroundsNew', 'new background', 'new backgrounds'],
     ['backgroundsChanged', 'changed background', 'changed backgrounds'],
     ['backgroundsDeleted', 'background to remove', 'backgrounds to remove'],
+    ['settingsChanged', 'setting', 'settings'],
     ['connectionsNew', 'new connection', 'new connections'],
     ['connectionsChanged', 'changed connection', 'changed connections'],
     ['connectionsDeleted', 'connection to remove', 'connections to remove'],
@@ -452,7 +453,9 @@ export function createPanel(ctx) {
                 ${toggle('syncPresets', 'Prompt presets (blocks and ordering)')}
                 ${toggle('syncPlaylists', 'Playlists (folders and character memberships)')}
                 ${toggle('syncBackgrounds', 'Backgrounds (chat wallpapers and bindings)')}
-                ${toggle('syncConnections', 'Connections (LLM profiles and API keys — opt-in)', true)}
+                ${toggle('syncSettings', 'Settings & Saved Prompts (Assistant/Studio prompts, NSFW toggles, extension settings)')}
+                ${toggle('syncConnections', 'Connections (LLM profiles, active profile bindings and API keys — opt-in)', true)}
+                ${toggle('syncSecrets', 'Provider secrets (site tokens, passwords, emails and refresh tokens — opt-in)', true)}
             </div>
             <div class="ls-auto-box">
                 <div class="settings-row">

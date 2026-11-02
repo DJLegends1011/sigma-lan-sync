@@ -599,3 +599,297 @@ test('same card imported on both devices and edited on one (with creator) pairs 
     assert.equal(servedMedia.status, 200, 'gallery picture is served under the original character');
     assert.ok(Buffer.from(await servedMedia.arrayBuffer()).equals(png), 'gallery picture bytes match');
 });
+
+test('assistant_sessions (with Chats) and studio_sessions (with Characters) sync by id, map chat_id and char_id aliases, null missing profile_id, respect prefer-newer, and show in Check', async () => {
+    const deskVannessa = (await desk.api('/characters?q=Vannessa')).body.items.find(c => c.name === 'Vannessa');
+    const phoneVannessa = (await phone.api('/characters?q=Vannessa')).body.items.find(c => c.name === 'Vannessa');
+    assert.ok(deskVannessa && phoneVannessa);
+    assert.notEqual(deskVannessa.id, phoneVannessa.id, 'Vannessa has different IDs on phone and desktop (twin alias)');
+
+    // Create a phone-only LLM profile so we can verify profile_id -> null on desk when Connections sync is off
+    const phoneOnlyProf = await phone.api('/llm/profiles', 'POST', {
+        name: 'Phone Local LLM',
+        kind: 'openai',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        ['api' + 'Key']: 'none',
+        model: 'llama3',
+    });
+    assert.ok(phoneOnlyProf.status < 300);
+    const phoneProfId = phoneOnlyProf.body.id;
+
+    // 1. Create an assistant_session on phone's Vannessa chat
+    const phoneChats = (await phone.api(`/chats?charId=${phoneVannessa.id}`)).body.items;
+    const phoneBranchChat = phoneChats.find(c => c.name === 'Vannessa - phone branch');
+    assert.ok(phoneBranchChat);
+
+    const asstCreate = await phone.api('/assistant/sessions', 'POST', {
+        chatId: phoneBranchChat.id,
+        name: 'Plot Brainstorm',
+    });
+    assert.equal(asstCreate.status, 201);
+    const asstId = asstCreate.body.id;
+    await phone.api(`/assistant/sessions/${asstId}`, 'PATCH', { profileId: phoneProfId });
+    const asstMsg = await phone.api(`/assistant/sessions/${asstId}/messages`, 'POST', {
+        role: 'user',
+        content: 'What should Vannessa do next?',
+    });
+    assert.ok(asstMsg.status < 300);
+
+    // 2. Create a studio_session on phone's Vannessa (char_id = phoneVannessa.id, which must map to deskVannessa.id)
+    const studioCreate = await phone.api('/creator/sessions', 'POST', {
+        charId: phoneVannessa.id,
+        name: 'Vannessa Card Polish',
+        draft: { name: 'Vannessa', personality: 'Witty, popular, secretly nerdy' },
+    });
+    assert.equal(studioCreate.status, 201);
+    const studioId = studioCreate.body.id;
+    await phone.api(`/creator/sessions/${studioId}`, 'PATCH', { profileId: phoneProfId });
+    const studioMsg = await phone.api(`/creator/sessions/${studioId}/messages`, 'POST', {
+        role: 'user',
+        content: 'Help me sharpen her personality.',
+    });
+    assert.ok(studioMsg.status < 300);
+
+    // 3. Check (dryRun) on desktop must see both the changed chat (assistant_session) and changed character (studio_session)
+    const check = await desk.ext(`/peers/${phoneId}/pull`, 'POST', { dryRun: true });
+    assert.equal(check.status, 200);
+    assert.ok(check.body.counts.chatsChanged >= 1, 'Check shows chat changed when assistant_session is added');
+    assert.ok(check.body.counts.charactersChanged >= 1, 'Check shows character changed when studio_session is added');
+
+    // 4. Pull on desktop
+    await pull(desk, phoneId);
+
+    const deskChats = (await desk.api(`/chats?charId=${deskVannessa.id}`)).body.items;
+    const deskBranchChat = deskChats.find(c => c.name === 'Vannessa - phone branch');
+    assert.ok(deskBranchChat);
+
+    const deskAsstList = (await desk.api(`/assistant/sessions?chatId=${deskBranchChat.id}`)).body;
+    assert.equal(deskAsstList.length, 1);
+    assert.equal(deskAsstList[0].id, asstId);
+    const deskAsstDetail = (await desk.api(`/assistant/sessions/${asstId}`)).body;
+    assert.equal(deskAsstDetail.name, 'Plot Brainstorm');
+    assert.equal(deskAsstDetail.profileId, null, 'profile_id mapped to null because connection is not on receiver');
+    assert.deepEqual(deskAsstDetail.messages.map(m => m.content), ['What should Vannessa do next?']);
+
+    const deskStudioList = (await desk.api(`/creator/sessions?charId=${deskVannessa.id}`)).body;
+    assert.equal(deskStudioList.length, 1);
+    assert.equal(deskStudioList[0].id, studioId);
+    const deskStudioDetail = (await desk.api(`/creator/sessions/${studioId}`)).body;
+    assert.equal(deskStudioDetail.charId, deskVannessa.id, 'studio_session char_id mapped through twin alias');
+    assert.equal(deskStudioDetail.profileId, null, 'studio_session profile_id mapped to null');
+    assert.equal(deskStudioDetail.draft.personality, 'Witty, popular, secretly nerdy');
+    assert.deepEqual(deskStudioDetail.messages.map(m => m.content), ['Help me sharpen her personality.']);
+
+    // 5. Verify prefer-newer keeps a newer assistant_session on desktop
+    await sleep(30);
+    await desk.api(`/assistant/sessions/${asstId}/messages`, 'POST', {
+        role: 'assistant',
+        content: 'She should invite him to the rooftop.',
+    });
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'prefer-newer' });
+    await pull(desk, phoneId);
+    const deskAsstAfter = (await desk.api(`/assistant/sessions/${asstId}`)).body;
+    assert.equal(deskAsstAfter.messages.length, 2, 'prefer-newer kept desktop newer assistant_session transcript');
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'exact' });
+});
+
+test('app_store documents (Saved Prompts for both panels, greetings-expanded, promoted_namespaces) merge by key', async () => {
+    const asstPrompts = {
+        version: 1,
+        prompts: [{ id: 'custom-1', icon: '⚡', label: 'Pacing check', text: 'Check the pacing of the last 5 turns.' }],
+    };
+    const studioPrompts = {
+        version: 1,
+        prompts: [{ id: 'studio-1', icon: '🎭', label: 'Voice check', text: 'Check dialogue voice consistency.' }],
+    };
+    const greetingsExpanded = { at: 1700000500000, changed: 3 };
+    const promotedNs = ['chub', 'janitorai', 'evolutia_custom'];
+
+    assert.equal((await phone.api('/store/assistant-prompts', 'PUT', asstPrompts)).status, 200);
+    assert.equal((await phone.api('/store/creator-studio-prompts', 'PUT', studioPrompts)).status, 200);
+    assert.equal((await phone.api('/store/greetings-expanded', 'PUT', greetingsExpanded)).status, 200);
+    assert.equal((await phone.api('/store/promoted_namespaces', 'PUT', promotedNs)).status, 200);
+
+    await pull(desk, phoneId);
+
+    assert.deepEqual((await desk.api('/store/assistant-prompts')).body, asstPrompts);
+    assert.deepEqual((await desk.api('/store/creator-studio-prompts')).body, studioPrompts);
+    assert.deepEqual((await desk.api('/store/greetings-expanded')).body, greetingsExpanded);
+    assert.deepEqual((await desk.api('/store/promoted_namespaces')).body, promotedNs);
+});
+
+test('settings dataset syncs allowlist, filters enabledExtensions to installed (reporting missing), gates secrets behind opt-in, and never syncs device-local keys', async () => {
+    // Create a shared LLM profile on both devices so we can test Connections-gated settings (chatProfileId, assistantProfileId, aiProfile.*)
+    const sharedProf = await phone.api('/llm/profiles', 'POST', {
+        name: 'Shared Cloud LLM',
+        kind: 'openai',
+        baseUrl: 'https://api.example.com/v1',
+        ['api' + 'Key']: 'sk-test',
+        model: 'gpt-4o',
+    });
+    assert.ok(sharedProf.status < 300);
+    const sharedProfId = sharedProf.body.id;
+
+    // Set allowlisted, Connections-gated, secret, and never-synced settings on phone
+    const patchRes = await phone.api('/settings', 'PATCH', {
+        assistantSystemPrompt: 'Act as a sharp story editor.',
+        creatorStudioSystemPrompt: 'Craft vivid character cards.',
+        assistantPromptsOpen: true,
+        creatorStudioPromptsOpen: true,
+        allowRichTagline: true,
+        browseSnapSections: true,
+        chubNsfw: true,
+        disabledProviders: ['wyvern'],
+        'ext:evolutia:window': 4,
+        enabledExtensions: ['evolutia', 'lan-sync', 'uninstalled-phantom-ext'],
+        // Connections-gated settings (syncConnections is OFF by default)
+        chatProfileId: sharedProfId,
+        assistantProfileId: sharedProfId,
+        'aiProfile.creator': sharedProfId,
+        // Secrets (opt-in is OFF by default)
+        chubToken: 'chub-secret-token-xyz',
+        janitoraiPassword: 'janitor-secret-password',
+        // Never-synced keys
+        activeChatId: 'chat-only-on-phone',
+        mobileSwipeGestures: false,
+        'ext:lan-sync:deviceName': 'Phone Custom Name',
+    });
+    assert.equal(patchRes.status, 200);
+
+    // Ensure desk starts with different values for never-synced, Connections-gated, and secret keys
+    await desk.api('/settings', 'PATCH', {
+        activeChatId: 'chat-on-desk',
+        mobileSwipeGestures: true,
+        'ext:lan-sync:deviceName': 'Desktop Custom Name',
+        chatProfileId: '',
+        assistantProfileId: '',
+        'aiProfile.creator': '',
+        chubToken: null,
+        janitoraiPassword: null,
+    });
+
+    // Dry-run Check should report missingExtensions
+    const dry = await desk.ext(`/peers/${phoneId}/pull`, 'POST', { dryRun: true });
+    assert.equal(dry.status, 200);
+    assert.deepEqual(dry.body.missingExtensions, ['uninstalled-phantom-ext']);
+
+    await pull(desk, phoneId);
+
+    const deskSettings = (await desk.api('/settings')).body;
+    // Allowlisted settings arrived
+    assert.equal(deskSettings.assistantSystemPrompt, 'Act as a sharp story editor.');
+    assert.equal(deskSettings.creatorStudioSystemPrompt, 'Craft vivid character cards.');
+    assert.equal(deskSettings.assistantPromptsOpen, true);
+    assert.equal(deskSettings.creatorStudioPromptsOpen, true);
+    assert.equal(deskSettings.allowRichTagline, true);
+    assert.equal(deskSettings.browseSnapSections, true);
+    assert.equal(deskSettings.chubNsfw, true);
+    assert.deepEqual(deskSettings.disabledProviders, ['wyvern']);
+    assert.equal(deskSettings['ext:evolutia:window'], 4);
+
+    // enabledExtensions filtered to installed only; missing extension listed in lastSync result
+    assert.ok(deskSettings.enabledExtensions.includes('evolutia'));
+    assert.ok(deskSettings.enabledExtensions.includes('lan-sync'));
+    assert.ok(!deskSettings.enabledExtensions.includes('uninstalled-phantom-ext'), 'uninstalled extension not enabled on receiver');
+    const st = (await desk.ext('/status')).body;
+    const peerEntry = st.peers.find(p => p.id === phoneId);
+    assert.deepEqual(peerEntry.lastSync.missingExtensions, ['uninstalled-phantom-ext']);
+
+    // Connections-gated profile bindings did NOT sync while syncConnections is off
+    assert.equal(deskSettings.chatProfileId, '', 'chatProfileId did not sync while syncConnections is off');
+    assert.equal(deskSettings.assistantProfileId, '', 'assistantProfileId did not sync while syncConnections is off');
+    assert.equal(deskSettings['aiProfile.creator'] || '', '', 'aiProfile.creator did not sync while syncConnections is off');
+
+    // Secrets did NOT sync while syncSecrets is off
+    assert.equal(deskSettings.chubToken, null, 'chubToken did not sync while syncSecrets is off');
+    assert.equal(deskSettings.janitoraiPassword, null, 'janitoraiPassword did not sync while syncSecrets is off');
+
+    // Never-synced keys stayed untouched on desktop
+    assert.equal(deskSettings.activeChatId, 'chat-on-desk', 'activeChatId never syncs');
+    assert.equal(deskSettings.mobileSwipeGestures, true, 'mobile* never syncs');
+    assert.equal(deskSettings['ext:lan-sync:deviceName'], 'Desktop Custom Name', 'ext:lan-sync:deviceName never syncs');
+
+    // Now opt in to syncSecrets and syncConnections on desktop and verify both sync when opted in
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:syncSecrets': true, 'ext:lan-sync:syncConnections': true });
+    await pull(desk, phoneId);
+    const deskSettingsWithSecrets = (await desk.api('/settings')).body;
+    assert.equal(deskSettingsWithSecrets.chubToken, 'chub-secret-token-xyz', 'chubToken syncs when syncSecrets is on');
+    assert.equal(deskSettingsWithSecrets.janitoraiPassword, 'janitor-secret-password', 'janitoraiPassword syncs when syncSecrets is on');
+    assert.equal(deskSettingsWithSecrets.chatProfileId, sharedProfId, 'chatProfileId syncs when syncConnections is on');
+    assert.equal(deskSettingsWithSecrets.assistantProfileId, sharedProfId, 'assistantProfileId syncs when syncConnections is on');
+    assert.equal(deskSettingsWithSecrets['aiProfile.creator'], sharedProfId, 'aiProfile.creator syncs when syncConnections is on');
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:syncSecrets': false, 'ext:lan-sync:syncConnections': false });
+});
+
+test('a "Send to It" sync with no browser open on the receiver leaves x_evolutia_cards and Demetri\'s {{evolutia_persona}} placeholder correct', async () => {
+    // 1. Create Demetri persona on both devices with a plain-text description on desktop
+    const demetriRes = await desk.api('/personas', 'POST', {
+        name: 'Demetri',
+        description: 'Demetri original plain description',
+    });
+    assert.ok(demetriRes.status < 300);
+    const demetriId = demetriRes.body.id;
+
+    // Pull Demetri to phone so both devices share Demetri
+    await pull(phone, deskId);
+
+    // On phone, switch Evolutia ON for Demetri and add an Alter Ego
+    const demetriOn = await phone.api(`/ext/evolutia/personas/${demetriId}/on`, 'PUT', {
+        on: true,
+        definition: {
+            alterEgos: [{
+                id: 'main',
+                name: 'Demetri',
+                fields: [{ id: 'f1', name: 'Base', content: 'Shapeshifter', defaultPhase: 'active', triggers: [], entryActions: [], exitActions: [] }],
+                triggers: [],
+                entryActions: [],
+                exitActions: [],
+            }],
+        },
+    });
+    assert.equal(demetriOn.status, 200);
+
+    // Edit Demetri's pronouns on desktop LATER than phone's persona update, and set desktop's overwrite to prefer-newer.
+    // That way, during "Send to It", desktop keeps its newer base `personas` row (whose description is still
+    // 'Demetri original plain description'), while receiving phone's `x_evolutia_personas` row (enabled = 1),
+    // so ONLY Evolutia's server-side `ctx.events.on` rebuild on desktop can switch desktop's Demetri description to `{{evolutia_persona}}`!
+    await sleep(30);
+    await desk.api(`/personas/${demetriId}`, 'PATCH', {
+        pronouns: { sub: 'he', obj: 'him', poss: 'his', possP: 'his', ref: 'himself' },
+    });
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'prefer-newer' });
+    await phone.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'prefer-newer' });
+
+    // Also import a new character on phone with Evolutia switched ON
+    const pushChar = await phone.call('importCard', {
+        name: 'PushHero',
+        description: 'Hero pushed from phone.',
+        first_mes: 'Ready!',
+        creator: 'wisperrr',
+    });
+    await phone.api(`/ext/evolutia/characters/${pushChar.id}/on`, 'PUT', { on: true });
+
+    // 2. Trigger "Send to It" (push) from phone -> desktop, with NO browser open and NO afterSync client command called
+    const pushed = await phone.ext(`/peers/${deskId}/push`, 'POST', {});
+    assert.equal(pushed.status, 200, JSON.stringify(pushed.body));
+    assert.equal(pushed.body.accepted, true);
+    const job = await jobDone(desk, pushed.body.jobId);
+    assert.equal(job.status, 'done', job.error);
+
+    // 3. Verify on desktop that x_evolutia_cards has PushHero enabled AND Demetri's description is {{evolutia_persona}}
+    const deskChars = (await desk.api('/characters?q=PushHero')).body.items;
+    const pushedOnDesk = deskChars.find(c => c.id === pushChar.id);
+    assert.ok(pushedOnDesk, 'PushHero arrived on desktop');
+    assert.equal(pushedOnDesk.ext?.evolutia?.on, 1, 'x_evolutia_cards rebuilt on receiver without browser open');
+
+    const deskPersonas = (await desk.api('/personas')).body.personas;
+    const deskDemetri = deskPersonas.find(p => p.id === demetriId);
+    assert.ok(deskDemetri);
+    assert.equal(deskDemetri.description, '{{evolutia_persona}}', 'Demetri description updated to {{evolutia_persona}} on receiver without browser open');
+    const deskDemetriEvo = (await desk.api(`/ext/evolutia/personas/${demetriId}`)).body;
+    assert.equal(deskDemetriEvo.on, true);
+    assert.equal(deskDemetriEvo.original, 'Demetri original plain description');
+
+    await desk.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'exact' });
+    await phone.api('/settings', 'PATCH', { 'ext:lan-sync:overwrite': 'exact' });
+});

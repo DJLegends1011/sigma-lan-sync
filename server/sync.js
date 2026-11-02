@@ -4,7 +4,16 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildManifestFromDb, buildFileManifest, eachLimited, DATASETS, enabledLanSyncExtensions } from './manifest.js';
+import {
+    buildManifestFromDb,
+    buildFileManifest,
+    eachLimited,
+    DATASETS,
+    enabledLanSyncExtensions,
+    isAllowedSettingKey,
+    isAllowedAppStoreKey,
+    installedExtensionIds,
+} from './manifest.js';
 import { makePlan, planCounts, planSize, alignSource } from './plan.js';
 
 const enc = encodeURIComponent;
@@ -13,12 +22,13 @@ const datasetsOf = (o) => DATASETS.filter(d => o[d] !== false);
 
 /**
  * Create an atomic SQLite snapshot of `db` in a temporary file.
- * Strips `llm_profiles` unless `includeConnections` is true, and always strips `changes` and `x_lan_sync_*`.
+ * Strips `llm_profiles` unless `includeConnections` is true, strips non-allowlisted `settings` (and secrets
+ * unless `includeSecrets` is true), and always strips `changes` and `x_lan_sync_*`.
  * @param {import('better-sqlite3').Database} db
- * @param {{includeConnections?: boolean}} [opts]
+ * @param {{includeConnections?: boolean, includeSecrets?: boolean}} [opts]
  * @returns {string} Path to temporary `.db` file (caller must unlink)
  */
-export function createDbSnapshot(db, { includeConnections = false } = {}) {
+export function createDbSnapshot(db, { includeConnections = false, includeSecrets = false } = {}) {
     const tmpFile = path.join(os.tmpdir(), `sigma-lan-sync-snap-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
     db.prepare('VACUUM INTO ?').run(tmpFile);
     // Clean up private/transient tables inside the snapshot copy using a temporary ATTACH on the same db handle
@@ -30,6 +40,23 @@ export function createDbSnapshot(db, { includeConnections = false } = {}) {
         if (!includeConnections) {
             try { db.exec(`DELETE FROM ${schema}.llm_profiles`); } catch { /* ignore */ }
         }
+        try {
+            const sRows = db.prepare(`SELECT key FROM ${schema}.settings`).all();
+            const delSetting = db.prepare(`DELETE FROM ${schema}.settings WHERE key = ?`);
+            for (const r of sRows) {
+                if (r.key === 'activePersonaId' || r.key === 'activePresetId') continue;
+                if (!isAllowedSettingKey(r.key, { includeConnections, includeSecrets })) {
+                    delSetting.run(r.key);
+                }
+            }
+        } catch { /* ignore */ }
+        try {
+            const aRows = db.prepare(`SELECT key FROM ${schema}.app_store`).all();
+            const delDoc = db.prepare(`DELETE FROM ${schema}.app_store WHERE key = ?`);
+            for (const r of aRows) {
+                if (!isAllowedAppStoreKey(r.key)) delDoc.run(r.key);
+            }
+        } catch { /* ignore */ }
         const extTables = db.prepare(`SELECT name FROM ${schema}.sqlite_master WHERE type = 'table' AND name LIKE 'x_lan_sync_%'`).all();
         for (const t of extTables) {
             db.exec(`DELETE FROM ${schema}."${t.name.replace(/"/g, '""')}"`);
@@ -76,19 +103,25 @@ export function resolveMediaFile(paths, kind, relPath, allowedExtIds = null) {
  */
 export async function runPull({ db, paths, ctx, peer, store, options, aliases = {}, signal, progress = () => {} }) {
     const datasets = datasetsOf(options);
+    const includeSecrets = options.secrets === true;
     const note = (text, done = 0, total = 0) => progress({ done, total, note: text });
 
     note('Scanning the other device');
-    const theirs = await peer.json('/peer/manifest', { method: 'POST', json: { datasets }, signal, timeout: 0 });
+    const theirs = await peer.json('/peer/manifest', { method: 'POST', json: { datasets, includeSecrets }, signal, timeout: 0 });
     note('Scanning this library');
-    const target = buildManifestFromDb(db, paths, store, { datasets });
+    const target = buildManifestFromDb(db, paths, store, { datasets, includeSecrets });
 
     note('Comparing');
     const aligned = alignSource(theirs, target, aliases);
     const known = aligned.aliases;
     const plan = makePlan(aligned.source, target, { datasets, mode: options.mode, overwrite: options.overwrite });
     const counts = planCounts(plan);
-    if (options.dryRun) return { counts, errors: [], aliases: known };
+    const installed = installedExtensionIds();
+    const remoteExtEntry = (theirs.settings || []).find(s => s.key === 'enabledExtensions');
+    const previewMissingExts = Array.isArray(remoteExtEntry?.extensions)
+        ? remoteExtEntry.extensions.filter(id => typeof id === 'string' && !installed.has(id))
+        : [];
+    if (options.dryRun) return { counts, errors: [], aliases: known, missingExtensions: previewMissingExts };
 
     const totalChanges = planSize(plan);
     const errors = [];
@@ -97,7 +130,7 @@ export async function runPull({ db, paths, ctx, peer, store, options, aliases = 
     note('Downloading database snapshot', 0, Math.max(1, totalChanges));
     const snapRes = await peer.request('/peer/db-snapshot', {
         method: 'POST',
-        json: { datasets, includeConnections: datasets.includes('connections') },
+        json: { datasets, includeConnections: datasets.includes('connections'), includeSecrets },
         signal,
         timeout: 0,
     });
@@ -106,18 +139,23 @@ export async function runPull({ db, paths, ctx, peer, store, options, aliases = 
     fs.writeFileSync(tmpSnap, snapBytes);
 
     let filesToDelete = [];
+    let missingExtensions = previewMissingExts;
     try {
         note('Applying database changes', 0, Math.max(1, totalChanges));
-        filesToDelete = mergeSnapshotIntoDb({
+        const mergeOut = mergeSnapshotIntoDb({
             db,
             paths,
+            ctx,
             tmpSnap,
             plan,
             datasets,
+            includeSecrets,
             mode: options.mode,
             overwrite: options.overwrite,
             aliases: known,
         });
+        filesToDelete = mergeOut.filesToDelete;
+        if (mergeOut.missingExtensions.length) missingExtensions = mergeOut.missingExtensions;
     } finally {
         try { fs.unlinkSync(tmpSnap); } catch { /* ignore */ }
     }
@@ -198,18 +236,21 @@ export async function runPull({ db, paths, ctx, peer, store, options, aliases = 
 
     // Emit change events on the host DB so every open browser tab refreshes its library, personas, presets, etc.
     emitSyncChanges(db, ctx);
+    // Allow setImmediate server event listeners (e.g. Evolutia's rebuildCardsTable) to finish before the pull resolves
+    await new Promise(r => setImmediate(r));
 
-    return { counts, errors, aliases: known };
+    return { counts, errors, aliases: known, missingExtensions };
 }
 
 /**
  * Attach `tmpSnap` as `remote` and merge all selected datasets inside one atomic SQLite transaction.
  */
-function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwrite, aliases }) {
+function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeSecrets = false, mode, overwrite, aliases }) {
     const want = new Set(datasets);
     const mirror = mode === 'mirror';
     const preferNewer = overwrite === 'prefer-newer';
     const filesToDelete = [];
+    const missingExtensionsSet = new Set();
 
     db.prepare('ATTACH DATABASE ? AS remote').run(tmpSnap);
     db.pragma('foreign_keys = OFF');
@@ -359,6 +400,47 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
                     }
                     // Clean up orphan tags
                     db.exec('DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM char_tags)');
+                }
+
+                // ── 2b. Creator Studio sessions (studio_sessions) with Characters ──
+                const hasLocalStudio = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'studio_sessions'").get();
+                const hasRemoteStudio = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'studio_sessions'").get();
+                if (hasLocalStudio && hasRemoteStudio) {
+                    const upsertStudio = db.prepare(upsertSql('studio_sessions', ['id']));
+                    const upsertStudioAtt = db.prepare(upsertSql('attachments', null, null, true));
+                    const remoteStudios = db.prepare('SELECT * FROM remote.studio_sessions').all();
+                    const seenStudioIds = new Set();
+                    for (const rss of remoteStudios) {
+                        const resolvedCharId = rss.char_id ? (aliases[rss.char_id] || rss.char_id) : null;
+                        if (resolvedCharId && !db.prepare('SELECT 1 FROM characters WHERE id = ?').get(resolvedCharId)) continue;
+                        seenStudioIds.add(rss.id);
+                        const loc = db.prepare('SELECT updated_at FROM studio_sessions WHERE id = ?').get(rss.id);
+                        if (loc && preferNewer && (loc.updated_at ?? 0) > (rss.updated_at ?? 0)) continue;
+                        const resolvedProfileId = rss.profile_id && db.prepare('SELECT 1 FROM llm_profiles WHERE id = ?').get(rss.profile_id)
+                            ? rss.profile_id
+                            : null;
+                        upsertStudio.run({
+                            ...rss,
+                            char_id: resolvedCharId,
+                            profile_id: resolvedProfileId,
+                        });
+                        const sAtts = db.prepare('SELECT * FROM remote.attachments WHERE studio_id = ?').all(rss.id);
+                        for (const sa of sAtts) {
+                            upsertStudioAtt.run({ ...sa, studio_id: rss.id, chat_id: null });
+                        }
+                    }
+                    if (mirror) {
+                        for (const lss of db.prepare('SELECT id FROM studio_sessions').all()) {
+                            if (!seenStudioIds.has(lss.id)) {
+                                const attRows = db.prepare('SELECT file FROM attachments WHERE studio_id = ?').all(lss.id);
+                                if (paths?.attachmentsRoot) {
+                                    for (const a of attRows) filesToDelete.push(path.join(paths.attachmentsRoot, lss.id, a.file));
+                                }
+                                db.prepare('DELETE FROM attachments WHERE studio_id = ?').run(lss.id);
+                                db.prepare('DELETE FROM studio_sessions WHERE id = ?').run(lss.id);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -593,7 +675,9 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
                     syncChatFull(c.id, c.id, c.charId);
                 }
                 for (const c of plan.chats.update) {
-                    syncChatFull(c.id, c.targetId, c.charId);
+                    if (c.base !== false) {
+                        syncChatFull(c.id, c.targetId, c.charId);
+                    }
                 }
                 if (mirror) {
                     for (const delId of plan.chats.delete) {
@@ -601,10 +685,57 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
                         if (paths?.attachmentsRoot) {
                             for (const a of attRows) filesToDelete.push(path.join(paths.attachmentsRoot, delId, a.file));
                         }
+                        try { db.prepare('DELETE FROM assistant_sessions WHERE chat_id = ?').run(delId); } catch { /* ignore */ }
                         db.prepare('DELETE FROM chat_messages WHERE chat_id = ?').run(delId);
                         db.prepare('DELETE FROM chat_worlds WHERE chat_id = ?').run(delId);
                         db.prepare('DELETE FROM attachments WHERE chat_id = ?').run(delId);
                         db.prepare('DELETE FROM chats WHERE id = ?').run(delId);
+                    }
+                }
+
+                // ── 6b. Chat Assistant sessions (assistant_sessions) with Chats ──
+                const hasLocalAsst = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'assistant_sessions'").get();
+                const hasRemoteAsst = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'assistant_sessions'").get();
+                if (hasLocalAsst && hasRemoteAsst) {
+                    const chatIdMap = new Map();
+                    for (const u of plan.chats.update) chatIdMap.set(u.id, u.targetId || u.id);
+                    for (const c of plan.chats.create) chatIdMap.set(c.id, c.id);
+                    const localChats = db.prepare('SELECT id, char_id, name FROM chats').all();
+                    const localById = new Set(localChats.map(c => c.id));
+                    const localByKey = new Map(localChats.map(c => [`${c.char_id || ''}\u0000${c.name}`, c.id]));
+                    for (const rch of db.prepare('SELECT id, char_id, name FROM remote.chats').all()) {
+                        if (chatIdMap.has(rch.id)) continue;
+                        const resolvedCharId = rch.char_id ? (aliases[rch.char_id] || rch.char_id) : '';
+                        const dstId = localById.has(rch.id)
+                            ? rch.id
+                            : localByKey.get(`${resolvedCharId}\u0000${rch.name}`);
+                        if (dstId) chatIdMap.set(rch.id, dstId);
+                    }
+
+                    const upsertAsst = db.prepare(upsertSql('assistant_sessions', ['id']));
+                    const remoteAssts = db.prepare('SELECT * FROM remote.assistant_sessions').all();
+                    const seenAsstIds = new Set();
+                    for (const ras of remoteAssts) {
+                        const dstChatId = chatIdMap.get(ras.chat_id) || ras.chat_id;
+                        if (!db.prepare('SELECT 1 FROM chats WHERE id = ?').get(dstChatId)) continue;
+                        seenAsstIds.add(ras.id);
+                        const loc = db.prepare('SELECT updated_at FROM assistant_sessions WHERE id = ?').get(ras.id);
+                        if (loc && preferNewer && (loc.updated_at ?? 0) > (ras.updated_at ?? 0)) continue;
+                        const resolvedProfileId = ras.profile_id && db.prepare('SELECT 1 FROM llm_profiles WHERE id = ?').get(ras.profile_id)
+                            ? ras.profile_id
+                            : null;
+                        upsertAsst.run({
+                            ...ras,
+                            chat_id: dstChatId,
+                            profile_id: resolvedProfileId,
+                        });
+                    }
+                    if (mirror) {
+                        for (const las of db.prepare('SELECT id FROM assistant_sessions').all()) {
+                            if (!seenAsstIds.has(las.id)) {
+                                db.prepare('DELETE FROM assistant_sessions WHERE id = ?').run(las.id);
+                            }
+                        }
                     }
                 }
             }
@@ -738,10 +869,85 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
                 }
             }
 
+            // ── 8c. app_store (Saved Prompts, greetings-expanded, promoted_namespaces) & allowlisted settings ──
+            if (want.has('settings') || want.has('chats') || want.has('characters')) {
+                const hasLocalStore = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'app_store'").get();
+                const hasRemoteStore = db.prepare("SELECT 1 FROM remote.sqlite_master WHERE type = 'table' AND name = 'app_store'").get();
+                if (hasLocalStore && hasRemoteStore) {
+                    const upsertDoc = db.prepare(`
+                        INSERT INTO app_store (key, value, updated_at) VALUES (?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                    `);
+                    for (const rdoc of db.prepare('SELECT key, value, updated_at FROM remote.app_store').all()) {
+                        if (!isAllowedAppStoreKey(rdoc.key)) continue;
+                        const loc = db.prepare('SELECT updated_at FROM app_store WHERE key = ?').get(rdoc.key);
+                        if (loc && preferNewer && (loc.updated_at ?? 0) > (rdoc.updated_at ?? 0)) continue;
+                        upsertDoc.run(rdoc.key, rdoc.value, rdoc.updated_at ?? Date.now());
+                    }
+                }
+            }
+
+            if (want.has('settings')) {
+                const includeConnections = want.has('connections');
+                const installedExts = installedExtensionIds();
+                const upsertSetting = db.prepare(`
+                    INSERT INTO settings (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                `);
+                for (const rset of db.prepare('SELECT key, value FROM remote.settings').all()) {
+                    if (!isAllowedSettingKey(rset.key, { includeConnections, includeSecrets })) continue;
+                    if (rset.key === 'enabledExtensions') {
+                        let remoteList = [];
+                        try {
+                            const parsed = JSON.parse(rset.value);
+                            if (Array.isArray(parsed)) remoteList = parsed.filter(x => typeof x === 'string');
+                        } catch { continue; }
+                        for (const extId of remoteList) {
+                            if (!installedExts.has(extId)) missingExtensionsSet.add(extId);
+                        }
+                        const validRemote = remoteList.filter(extId => installedExts.has(extId));
+                        let localList = [];
+                        try {
+                            const locRow = db.prepare("SELECT value FROM settings WHERE key = 'enabledExtensions'").get();
+                            const parsedLoc = locRow?.value ? JSON.parse(locRow.value) : [];
+                            if (Array.isArray(parsedLoc)) localList = parsedLoc.filter(x => typeof x === 'string');
+                        } catch { localList = []; }
+                        const merged = mirror
+                            ? [...new Set([...validRemote, ...(localList.includes('lan-sync') ? ['lan-sync'] : [])])]
+                            : [...new Set([...localList, ...validRemote])];
+                        upsertSetting.run('enabledExtensions', JSON.stringify(merged));
+                        continue;
+                    }
+                    if (rset.key === 'chatProfileId' || rset.key === 'assistantProfileId' || rset.key.startsWith('aiProfile.')) {
+                        let profId = rset.value;
+                        try { profId = JSON.parse(rset.value); } catch { /* raw */ }
+                        if (typeof profId === 'string' && profId) {
+                            const exists = db.prepare('SELECT 1 FROM llm_profiles WHERE id = ?').get(profId);
+                            if (!exists) continue;
+                        }
+                    }
+                    upsertSetting.run(rset.key, rset.value);
+                }
+            }
+
             // ── 9. Rebuild FTS5 search indexes if needed ──
             if (want.has('characters')) {
                 try { db.exec("INSERT INTO card_tokens_fts(card_tokens_fts) VALUES ('rebuild')"); } catch { /* populated lazily */ }
             }
+
+            // ── 10. Report changes inside the merge transaction so extensions (e.g. Evolutia) rebuild on the server ──
+            try { ctx?.report?.(db, { entity: 'library', op: 'changed' }); } catch { /* library not in LibraryWriteEntity */ }
+            try {
+                ctx?.report?.(db, { entity: 'character', op: 'updated', all: true });
+                ctx?.report?.(db, { entity: 'persona', op: 'updated', all: true });
+                ctx?.report?.(db, { entity: 'chat', op: 'updated', all: true });
+                ctx?.report?.(db, { entity: 'world', op: 'updated', all: true });
+                ctx?.report?.(db, { entity: 'preset', op: 'updated', all: true });
+                ctx?.report?.(db, { entity: 'playlist', op: 'updated', all: true });
+                ctx?.report?.(db, { entity: 'background', op: 'updated', all: true });
+                ctx?.report?.(db, { entity: 'setting', op: 'updated', all: true });
+                ctx?.report?.(db, { entity: 'document', op: 'updated', all: true });
+            } catch { /* ignore if db is untracked in unit test */ }
         });
 
         tx();
@@ -749,7 +955,7 @@ function mergeSnapshotIntoDb({ db, paths, tmpSnap, plan, datasets, mode, overwri
         try { db.pragma('foreign_keys = ON'); } catch { /* ignore */ }
         try { db.exec('DETACH DATABASE remote'); } catch { /* ignore */ }
     }
-    return filesToDelete;
+    return { filesToDelete, missingExtensions: [...missingExtensionsSet] };
 }
 
 /**

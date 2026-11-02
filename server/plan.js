@@ -25,6 +25,9 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
         presets: { create: [], update: [], delete: [] },
         playlists: { create: [], update: [], delete: [] },
         backgrounds: { create: [], update: [], delete: [] },
+        settings: { put: [] },
+        appStore: { put: [] },
+        unboundStudio: { put: [], delete: [] },
         connections: { create: [], update: [], delete: [] },
         kept: 0, // items the target kept because its own copy is newer
     };
@@ -41,16 +44,39 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             const card = s.card !== t.card;
             const meta = s.meta !== t.meta;
             const media = s.mediaSig ? s.mediaSig !== t.mediaSig : s.mediaCount > t.mediaCount;
-            if (!card && !meta && !media) continue;
-            if ((card || meta) && preferNewer && t.updatedAt > s.updatedAt) {
-                plan.kept++;
-                if (!media) continue;
-                plan.characters.update.push({ id: s.id, sourceId, card: false, meta: false, media });
-                continue;
-            }
-            plan.characters.update.push({ id: s.id, sourceId, card, meta, media });
+            const studio = (s.studioDigest || '') !== (t.studioDigest || '');
+            if (!card && !meta && !media && !studio) continue;
+            const cardMetaKept = (card || meta) && preferNewer && t.updatedAt > s.updatedAt;
+            const studioKept = studio && preferNewer && (t.studioUpdatedAt ?? 0) > (s.studioUpdatedAt ?? 0);
+            if (cardMetaKept) plan.kept++;
+            if (studioKept && !cardMetaKept) plan.kept++;
+            const syncCard = card && !cardMetaKept;
+            const syncMeta = meta && !cardMetaKept;
+            const syncStudio = studio && !studioKept;
+            if (!syncCard && !syncMeta && !media && !syncStudio) continue;
+            plan.characters.update.push({
+                id: s.id,
+                sourceId,
+                card: syncCard,
+                meta: syncMeta,
+                media,
+                ...(syncStudio ? { studio: true } : {}),
+            });
         }
         if (mirror) plan.characters.delete = target.characters.filter(t => !sourceChars.has(t.id)).map(t => t.id);
+
+        const srcUnbound = source.unboundStudio || [];
+        const tgtUnbound = target.unboundStudio || [];
+        const tgtUnboundById = new Map(tgtUnbound.map(u => [u.id, u]));
+        const srcUnboundIds = new Set(srcUnbound.map(u => u.id));
+        for (const s of srcUnbound) {
+            const t = tgtUnboundById.get(s.id);
+            if (!t) { plan.unboundStudio.put.push(s.id); continue; }
+            if (t.digest === s.digest) continue;
+            if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) { plan.kept++; continue; }
+            plan.unboundStudio.put.push(s.id);
+        }
+        if (mirror) plan.unboundStudio.delete = tgtUnbound.filter(t => !srcUnboundIds.has(t.id)).map(t => t.id);
     }
 
     if (want.has('chats')) {
@@ -66,6 +92,19 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
             if (!t) { plan.chats.create.push({ id: s.id, charId: s.charId, name: s.name }); continue; }
             matchedTargetIds.add(t.id);
             if (t.digest === s.digest && t.name === s.name) continue;
+            if (s.baseDigest !== undefined && t.baseDigest !== undefined) {
+                const baseDiff = s.baseDigest !== t.baseDigest || s.name !== t.name;
+                const asstDiff = (s.asstDigest || '') !== (t.asstDigest || '');
+                const baseKept = baseDiff && preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0);
+                const asstKept = asstDiff && preferNewer && (t.asstUpdatedAt ?? 0) > (s.asstUpdatedAt ?? 0);
+                if (baseKept) plan.kept++;
+                if (asstKept && !baseKept) plan.kept++;
+                const syncBase = baseDiff && !baseKept;
+                const syncAsst = asstDiff && !asstKept;
+                if (!syncBase && !syncAsst) continue;
+                plan.chats.update.push({ id: s.id, targetId: t.id, charId: s.charId, name: s.name, base: syncBase, asst: syncAsst });
+                continue;
+            }
             if (preferNewer && t.updatedAt > s.updatedAt) { plan.kept++; continue; }
             plan.chats.update.push({ id: s.id, targetId: t.id, charId: s.charId, name: s.name });
         }
@@ -197,6 +236,29 @@ export function makePlan(source, target, { datasets, mode, overwrite }) {
         if (mirror) plan.backgrounds.delete = tgtList.filter(t => !matchedTargetIds.has(t.id)).map(t => t.id);
     }
 
+    if (want.has('settings') || want.has('chats') || want.has('characters')) {
+        const srcDocs = source.appStore || [];
+        const tgtDocs = new Map((target.appStore || []).map(d => [d.key, d]));
+        for (const s of srcDocs) {
+            const t = tgtDocs.get(s.key);
+            if (!t) { plan.appStore.put.push(s.key); continue; }
+            if (t.digest === s.digest) continue;
+            if (preferNewer && (t.updatedAt ?? 0) > (s.updatedAt ?? 0)) { plan.kept++; continue; }
+            plan.appStore.put.push(s.key);
+        }
+    }
+
+    if (want.has('settings')) {
+        const srcSettings = source.settings || [];
+        const tgtSettings = new Map((target.settings || []).map(s => [s.key, s]));
+        for (const s of srcSettings) {
+            const t = tgtSettings.get(s.key);
+            if (!t || t.digest !== s.digest) {
+                plan.settings.put.push(s.key);
+            }
+        }
+    }
+
     if (want.has('connections')) {
         const srcList = source.connections || [];
         const tgtList = target.connections || [];
@@ -308,6 +370,9 @@ export function alignSource(source, target, aliases = {}) {
                 return { ...p, members };
             }),
             backgrounds: source.backgrounds || [],
+            settings: source.settings || [],
+            appStore: source.appStore || [],
+            unboundStudio: source.unboundStudio || [],
             connections: source.connections || [],
         },
     };
@@ -317,8 +382,8 @@ export function alignSource(source, target, aliases = {}) {
 export function planCounts(plan) {
     return {
         charactersNew: plan.characters.create.length,
-        charactersChanged: plan.characters.update.length,
-        charactersDeleted: plan.characters.delete.length,
+        charactersChanged: plan.characters.update.length + (plan.unboundStudio?.put || []).length,
+        charactersDeleted: plan.characters.delete.length + (plan.unboundStudio?.delete || []).length,
         chatsNew: plan.chats.create.length,
         chatsChanged: plan.chats.update.length,
         chatsDeleted: plan.chats.delete.length,
@@ -336,6 +401,7 @@ export function planCounts(plan) {
         backgroundsNew: (plan.backgrounds?.create || []).length,
         backgroundsChanged: (plan.backgrounds?.update || []).length,
         backgroundsDeleted: (plan.backgrounds?.delete || []).length,
+        settingsChanged: (plan.settings?.put || []).length + (plan.appStore?.put || []).length,
         connectionsNew: (plan.connections?.create || []).length,
         connectionsChanged: (plan.connections?.update || []).length,
         connectionsDeleted: (plan.connections?.delete || []).length,
@@ -351,5 +417,6 @@ export const planSize = (plan) => {
         + c.presetsNew + c.presetsChanged + c.presetsDeleted
         + c.playlistsNew + c.playlistsChanged + c.playlistsDeleted
         + c.backgroundsNew + c.backgroundsChanged + c.backgroundsDeleted
+        + c.settingsChanged
         + c.connectionsNew + c.connectionsChanged + c.connectionsDeleted;
 };

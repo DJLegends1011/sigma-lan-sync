@@ -97,7 +97,9 @@ export function register(router, ctx) {
         presets: ctx.setting(db, 'syncPresets') !== false,
         playlists: ctx.setting(db, 'syncPlaylists') !== false,
         backgrounds: ctx.setting(db, 'syncBackgrounds') !== false,
+        settings: ctx.setting(db, 'syncSettings') !== false,
         connections: ctx.setting(db, 'syncConnections') === true,
+        secrets: ctx.setting(db, 'syncSecrets') === true,
         mode: ctx.setting(db, 'mode') === 'mirror' ? 'mirror' : 'incremental',
         overwrite: ctx.setting(db, 'overwrite') === 'prefer-newer' ? 'prefer-newer' : 'exact',
     });
@@ -653,11 +655,18 @@ export function register(router, ctx) {
                 const result = await runPull({ db, paths, ctx, peer, store, options, aliases, signal, progress });
                 store.updatePeer(peerRecord.id, {
                     aliases: result.aliases,
-                    lastSync: { at: Date.now(), direction: 'pull', counts: result.counts, errors: result.errors.slice(0, 20) },
+                    lastSync: {
+                        at: Date.now(),
+                        direction: 'pull',
+                        counts: result.counts,
+                        errors: result.errors.slice(0, 20),
+                        missingExtensions: result.missingExtensions || [],
+                    },
                 });
                 if (result.errors.length) {
                     throw new Error(`${result.errors.length} item${result.errors.length === 1 ? '' : 's'} could not be synced: ${result.errors.slice(0, 3).map(e => `${e.what} (${e.error})`).join('; ')}`);
                 }
+                return { counts: result.counts, missingExtensions: result.missingExtensions || [] };
             },
         });
     };
@@ -671,8 +680,8 @@ export function register(router, ctx) {
         if (req.body?.dryRun) {
             const peer = peerClient({ address: record.address, deviceId: me.deviceId, secret: record.secret });
             try {
-                const { counts } = await runPull({ db: req.db, paths: req.paths, ctx, peer, store, aliases: record.aliases || {}, options: { ...options, dryRun: true } });
-                return res.json({ counts, options });
+                const { counts, missingExtensions } = await runPull({ db: req.db, paths: req.paths, ctx, peer, store, aliases: record.aliases || {}, options: { ...options, dryRun: true } });
+                return res.json({ counts, options, missingExtensions: missingExtensions || [] });
             } catch (e) {
                 return res.status(502).json({ error: e.message });
             }
@@ -730,16 +739,18 @@ export function register(router, ctx) {
     router.post('/peer/manifest', signed, async (req, res, next) => {
         const { store } = parts(req);
         const datasets = (Array.isArray(req.body?.datasets) ? req.body.datasets : DATASETS).filter(d => DATASETS.includes(d));
+        const includeSecrets = req.body?.includeSecrets === true;
         try {
-            res.json(buildManifestFromDb(req.db, req.paths, store, { datasets }));
+            res.json(buildManifestFromDb(req.db, req.paths, store, { datasets, includeSecrets }));
         } catch (e) { next(e); }
     });
 
     router.post('/peer/db-snapshot', signed, (req, res, next) => {
         const includeConnections = req.body?.includeConnections === true;
+        const includeSecrets = req.body?.includeSecrets === true;
         let tmpFile = null;
         try {
-            tmpFile = createDbSnapshot(req.db, { includeConnections });
+            tmpFile = createDbSnapshot(req.db, { includeConnections, includeSecrets });
             const stat = fs.statSync(tmpFile);
             res.setHeader('Content-Type', 'application/x-sqlite3');
             res.setHeader('Content-Length', String(stat.size));
@@ -895,7 +906,9 @@ export function register(router, ctx) {
             presets: asked.presets !== false,
             playlists: asked.playlists !== false,
             backgrounds: asked.backgrounds !== false,
+            settings: asked.settings !== false,
             connections: asked.connections === true && own.connections === true,
+            secrets: asked.secrets === true && own.secrets === true,
             overwrite: asked.overwrite === 'prefer-newer' ? 'prefer-newer' : 'exact',
             mode: own.mode,
         };

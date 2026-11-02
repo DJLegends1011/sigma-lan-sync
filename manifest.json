@@ -1,7 +1,7 @@
 {
     "id": "lan-sync",
     "name": "LAN Sync",
-    "version": "0.4.4",
+    "version": "0.4.5",
     "author": "DJLegends",
     "description": "Keeps two Project Σ installs in step over your network via automatic LAN discovery, manual IP, or QR code, with direct SQLite database + media sync and scheduled Auto Sync.",
     "requires": { "api": "2.5" },
@@ -14,7 +14,9 @@
         "syncPresets": true,
         "syncPlaylists": true,
         "syncBackgrounds": true,
+        "syncSettings": true,
         "syncConnections": false,
+        "syncSecrets": false,
         "mode": "incremental",
         "overwrite": "exact"
     },
