@@ -1,5 +1,6 @@
 // One device of the two-device test: a real Project Σ server (the extension kit's) in a process of its own,
 // since the kit runs one server a process. The parent drives it over IPC and over HTTP.
+process.env.CL_LAN_SYNC_NO_DISCOVERY = '1';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';

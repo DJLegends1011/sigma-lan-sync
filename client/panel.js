@@ -487,11 +487,25 @@ export function createPanel(ctx) {
 
     // ── refresh and clicks ──────────────────────────────────
 
+    let hadRunningJob = false;
+    let lastDoneJobEnd = 0;
+
+    function maxDoneJobEnd(jobs) {
+        let max = 0;
+        for (const j of jobs || []) {
+            if (j.status === 'done' && (j.endedAt || 0) > max) max = j.endedAt || 0;
+        }
+        return max;
+    }
+
     async function refresh() {
         if (!body) return;
+        const prevDoneEnd = lastDoneJobEnd;
         try {
             status = await call('/status');
             requests = status.requests || [];
+            hadRunningJob = (status.jobs || []).some(j => j.status === 'running' || j.status === 'queued');
+            lastDoneJobEnd = Math.max(lastDoneJobEnd, maxDoneJobEnd(status.jobs));
         } catch (e) {
             const el = region('peers');
             const message = e?.status === 404
@@ -505,9 +519,10 @@ export function createPanel(ctx) {
         paintPeers();
         const sumEl = body?.querySelector('[data-ls="prefs-summary"]');
         if (sumEl) sumEl.textContent = optionsSummaryText();
+        if (prevDoneEnd > 0 && lastDoneJobEnd > prevDoneEnd && !hadRunningJob) {
+            runAfterSyncCommands();
+        }
     }
-
-    let hadRunningJob = false;
 
     async function runAfterSyncCommands() {
         try {
@@ -538,14 +553,21 @@ export function createPanel(ctx) {
             const nextReqs = JSON.stringify(nextStatus.requests || []);
             const prevNearby = JSON.stringify(status?.nearby || []);
             const nextNearby = JSON.stringify(nextStatus.nearby || []);
+            const prevJobs = JSON.stringify(status?.jobs || []);
+            const nextJobs = JSON.stringify(nextStatus.jobs || []);
+            const prevPeers = JSON.stringify(status?.peers || []);
+            const nextPeers = JSON.stringify(nextStatus.peers || []);
             const nowRunning = (nextStatus.jobs || []).some(j => j.status === 'running' || j.status === 'queued');
             const busy = hadRunningJob || nowRunning;
-            const justFinished = hadRunningJob && !nowRunning && (nextStatus.jobs || []).some(j => j.status === 'done');
+            const nextDoneEnd = maxDoneJobEnd(nextStatus.jobs);
+            const justFinished = (hadRunningJob && !nowRunning && (nextStatus.jobs || []).some(j => j.status === 'done'))
+                || (nextDoneEnd > lastDoneJobEnd && !nowRunning);
             hadRunningJob = nowRunning;
+            if (nextDoneEnd > lastDoneJobEnd) lastDoneJobEnd = nextDoneEnd;
             status = nextStatus;
             requests = nextStatus.requests || [];
             if (prevReqs !== nextReqs) paintRequests();
-            if (prevNearby !== nextNearby || busy) {
+            if (prevNearby !== nextNearby || prevJobs !== nextJobs || prevPeers !== nextPeers || busy) {
                 paintDevice();
                 paintPeers();
             }

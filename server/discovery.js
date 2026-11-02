@@ -65,6 +65,7 @@ export function createLanDiscovery() {
         }
 
         if (msg.type === 'announce' && typeof msg.id === 'string' && msg.id) {
+            if (msg.loopbackOnly) return;
             if (localAnnouncement && msg.id === localAnnouncement.id) return;
             const port = Number(msg.port);
             if (!Number.isInteger(port) || port < 1 || port > 65535) return;
@@ -171,7 +172,8 @@ export function createLanDiscovery() {
 
     return {
         announce(info) {
-            if (!info?.id || !info?.port) return;
+            if (process.env.CL_LAN_SYNC_NO_DISCOVERY === '1') return;
+            if (!info?.id || !info?.port || info.loopbackOnly) return;
             localAnnouncement = {
                 id: info.id,
                 name: String(info.name || 'Project Σ').slice(0, 60),
@@ -184,6 +186,8 @@ export function createLanDiscovery() {
             sendAnnounce();
         },
         query() {
+            if (process.env.CL_LAN_SYNC_NO_DISCOVERY === '1') return;
+            if (localAnnouncement?.loopbackOnly) return;
             ensureSocket();
             sendQuery();
             sendAnnounce();
