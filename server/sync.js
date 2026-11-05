@@ -1186,8 +1186,8 @@ export function mergeDuplicateCharacter(db, paths, store, { fromId, intoId, peer
                 }
             } catch { /* ignore */ }
 
-            // 4. Move any extension x_* tables with a char_id column
-            const extTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'x_%'").pluck().all();
+            // 4. Move only tables whose enabled owner explicitly opted in to LAN sync.
+            const extTables = new Set(enabledLanSyncExtensions(db).flatMap(ext => ext.tables));
             for (const tbl of extTables) {
                 try {
                     const cols = db.pragma(`table_info("${tbl}")`).map(c => c.name);
