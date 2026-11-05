@@ -38,7 +38,6 @@ export function createDbSnapshot(db, { includeConnections = false, includeSecret
     try {
         // Zero deleted cells on delete so stripped secrets/profiles never linger in free pages
         db.pragma(`${schema}.secure_delete = ON`);
-        try { db.exec(`DELETE FROM ${schema}.change_log`); } catch { /* ignore */ }
         try { db.exec(`DELETE FROM ${schema}.changes`); } catch { /* ignore */ }
         if (!includeConnections) {
             try { db.exec(`DELETE FROM ${schema}.llm_profiles`); } catch { /* ignore */ }
@@ -248,8 +247,6 @@ export async function runPull({ db, paths, ctx, peer, store, options, aliases = 
         }
     }, signal);
 
-    // Emit change events on the host DB so every open browser tab refreshes its library, personas, presets, etc.
-    emitSyncChanges(db, ctx);
     // Allow setImmediate server event listeners (e.g. Evolutia's rebuildCardsTable) to finish before the pull resolves
     await new Promise(r => setImmediate(r));
 
@@ -1056,8 +1053,7 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
                 try { db.exec("INSERT INTO card_tokens_fts(card_tokens_fts) VALUES ('rebuild')"); } catch { /* populated lazily */ }
             }
 
-            // ── 10. Report changes inside the merge transaction so extensions (e.g. Evolutia) rebuild on the server ──
-            try { ctx?.report?.(db, { entity: 'library', op: 'changed' }); } catch { /* library not in LibraryWriteEntity */ }
+            // ── 10. Report changes inside the merge transaction so open browser tabs and extension listeners refresh ──
             try {
                 ctx?.report?.(db, { entity: 'character', op: 'updated', all: true });
                 ctx?.report?.(db, { entity: 'persona', op: 'updated', all: true });
@@ -1077,26 +1073,6 @@ function mergeSnapshotIntoDb({ db, paths, ctx, tmpSnap, plan, datasets, includeS
         try { db.exec('DETACH DATABASE remote'); } catch { /* ignore */ }
     }
     return { filesToDelete, missingExtensions: [...missingExtensionsSet] };
-}
-
-/**
- * Emit change events so open Project Σ tabs immediately refresh characters, chats, personas, presets, playlists, etc.
- */
-function emitSyncChanges(db, ctx) {
-    try {
-        const ins = db.prepare('INSERT INTO change_log (at, entity, op, id, parent_id, summary) VALUES (?, ?, ?, ?, ?, ?)');
-        const now = Date.now();
-        ins.run(now, 'library', 'changed', 'all', null, JSON.stringify({ reason: 'resync' }));
-        ins.run(now, 'persona', 'changed', 'all', null, null);
-        ins.run(now, 'preset', 'changed', 'all', null, null);
-        ins.run(now, 'playlist', 'changed', 'all', null, null);
-        ins.run(now, 'world', 'changed', 'all', null, null);
-        ins.run(now, 'settings', 'updated', 'activePersonaId', null, null);
-        ins.run(now, 'settings', 'updated', 'activePresetId', null, null);
-    } catch { /* ignore if change_log table unavailable */ }
-    try {
-        ctx?.report?.(db, 'library', 'all', { reason: 'resync' });
-    } catch { /* ignore */ }
 }
 
 /**
