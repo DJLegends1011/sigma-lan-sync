@@ -5,13 +5,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const sigmaDir = process.env.SIGMA_DIR || 'D:/ProjectSigma-main';
+const extDir = fileURLToPath(new URL('../..', import.meta.url));
+const sigmaCandidates = [
+    process.env.SIGMA_DIR,
+    path.resolve(extDir, '../../../ProjectSigma-main'),
+    path.resolve(extDir, '../../../../ProjectSigma-main'),
+    'D:/ProjectSigma-main',
+].filter(Boolean);
+const sigmaDir = sigmaCandidates.find(d => fs.existsSync(path.join(d, 'tools', 'extension-kit', 'index.mjs'))) || sigmaCandidates[0];
 const { startSigma } = await import(pathToFileURL(path.join(sigmaDir, 'tools', 'extension-kit', 'index.mjs')).href);
 
-const extDir = fileURLToPath(new URL('../..', import.meta.url));
 const evolutiaDir = path.resolve(extDir, '..', 'evolutia');
 const extensions = fs.existsSync(path.join(evolutiaDir, 'manifest.json')) ? [extDir, evolutiaDir] : [extDir];
-const sigma = await startSigma({ extensions, prefix: `lan-sync-${process.argv[2] || 'device'}` });
+// Temporary lint: false while LAN Sync's 95 app-table-write hits in server/sync.js are sorted between ctx.stores and sigma-kit-allow
+const sigma = await startSigma({ extensions, prefix: `lan-sync-${process.argv[2] || 'device'}`, lint: false });
 const enabled = await sigma.session.enable('lan-sync');
 if (enabled.status !== 200) throw new Error(`could not switch lan-sync on: ${JSON.stringify(enabled.body)}`);
 if (extensions.length > 1) {

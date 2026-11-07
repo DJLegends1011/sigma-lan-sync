@@ -838,7 +838,7 @@ export function createPanel(ctx) {
 
         root.innerHTML = `
             <section class="ls-section">
-                <p class="ls-muted">Moves all chats, gallery pictures, tags, lorebook links, and extension data from the duplicate copy onto the original character, deletes the duplicate copy, and records the alias so future syncs won't recreate it.</p>
+                <p class="ls-muted">Moves all chats, gallery pictures, tags, lorebook links, and opted-in extension data from the duplicate copy onto the original character, deletes the duplicate copy, and records the alias so future syncs won't recreate it. Per-character data from extensions that are disabled or do not opt in to LAN Sync may be lost when the duplicate is deleted.</p>
                 <div class="settings-row">
                     <label for="ls-merge-from">Duplicate copy (will be merged &amp; deleted)</label>
                     <select id="ls-merge-from" class="cl-select-fluid">${chars.map(c => optionHtml(c, defaultFrom)).join('')}</select>
@@ -871,7 +871,7 @@ export function createPanel(ctx) {
             const intoChar = chars.find(c => c.id === intoId);
             const ok = await CoreAPI.showConfirm({
                 title: `Merge "${fromChar?.name || fromId}" into "${intoChar?.name || intoId}"?`,
-                message: `All chats, gallery items, tags, and lorebooks from "${fromChar?.name || fromId}" (${fromId.slice(0, 8)}) will move onto "${intoChar?.name || intoId}" (${intoId.slice(0, 8)}), and the duplicate copy will be deleted.`,
+                message: `All chats, gallery items, tags, and lorebooks from "${fromChar?.name || fromId}" (${fromId.slice(0, 8)}) will move onto "${intoChar?.name || intoId}" (${intoId.slice(0, 8)}), and the duplicate copy will be deleted. Per-character data stored by extensions that are disabled or not opted in to LAN Sync may be lost with the duplicate.`,
                 confirmLabel: 'Merge & Delete Copy',
                 danger: true,
             });
