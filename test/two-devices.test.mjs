@@ -252,7 +252,8 @@ test('the phone pulls the whole library, ids and all', async () => {
     const presets = (await phone.api('/presets')).body.presets;
     assert.equal(presets.length, 1);
     assert.equal(presets[0].name, 'Space Opera');
-    assert.equal(presets[0].blocks[0].content, 'Write space opera.');
+    const preset = (await phone.api(`/presets/${encodeURIComponent(presets[0].id)}`)).body;
+    assert.equal(preset.blocks[0].content, 'Write space opera.');
 
     const playlistsDoc = (await phone.api('/playlists')).body;
     const plId = playlistsDoc.order[0];
